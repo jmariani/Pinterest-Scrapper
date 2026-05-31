@@ -9,19 +9,26 @@ module PinterestScrapper
     SUCCESS = 0
     ERROR = 1
 
-    def initialize(argv, stdout: $stdout, stderr: $stderr, stdin: $stdin)
+    def initialize(argv, stdout: $stdout, stderr: $stderr, stdin: $stdin, app_factory: nil)
       @argv = argv
       @stdout = stdout
       @stderr = stderr
       @stdin = stdin
+      @app_factory = app_factory || lambda do |target_folder, pinterest_url|
+        App.new(target_folder: target_folder, pinterest_url: pinterest_url)
+      end
     end
 
     def call
       target_folder, pinterest_url = parse_arguments
-      result = App.new(target_folder: target_folder, pinterest_url: pinterest_url).run
+      result = app_factory.call(target_folder, pinterest_url).run
 
       stdout.puts "Target folder: #{result.target_folder}"
       stdout.puts "Pinterest URL: #{result.pinterest_url}"
+      stdout.puts "Pin URL: #{result.pin_url}"
+      stdout.puts "Image original URLs: #{result.image_original_urls.length}"
+      stdout.puts "URL manifest: #{result.url_manifest_file}"
+      stdout.puts "Pins manifest: #{result.pins_manifest_file}"
 
       SUCCESS
     rescue ArgumentError => e
@@ -29,11 +36,15 @@ module PinterestScrapper
       stderr.puts usage
 
       ERROR
+    rescue StandardError => e
+      stderr.puts "Error: #{e.message}"
+
+      ERROR
     end
 
     private
 
-    attr_reader :argv, :stdout, :stderr, :stdin
+    attr_reader :argv, :stdout, :stderr, :stdin, :app_factory
 
     def parse_arguments
       unless [1, 2].include?(argv.length)

@@ -1,6 +1,9 @@
 # Pinterest Scrapper
 
 A small Ruby command-line app that accepts a target folder and a Pinterest URL.
+It opens the Pinterest URL in Safari, collects the pin URL and Pinterest image
+original URLs, then writes the results to `url_manifest.json` and
+`pins_manifest.json` in the target folder.
 
 ## Usage
 
