@@ -15,7 +15,11 @@ module PinterestScrapper
       @stderr = stderr
       @stdin = stdin
       @app_factory = app_factory || lambda do |target_folder, pinterest_url|
-        App.new(target_folder: target_folder, pinterest_url: pinterest_url)
+        App.new(
+          target_folder: target_folder,
+          pinterest_url: pinterest_url,
+          progress: method(:report_progress)
+        )
       end
     end
 
@@ -26,7 +30,11 @@ module PinterestScrapper
       stdout.puts "Target folder: #{result.target_folder}"
       stdout.puts "Pinterest URL: #{result.pinterest_url}"
       stdout.puts "Pin URL: #{result.pin_url}"
+      stdout.puts "Pin URLs: #{result.pin_urls.length}"
       stdout.puts "Image original URLs: #{result.image_original_urls.length}"
+      stdout.puts "Saved images: #{result.saved_image_files.length}"
+      stdout.puts "Skipped images: #{result.skipped_image_files.length}"
+      stdout.puts "Failed images: #{result.failed_image_urls.length}"
       stdout.puts "URL manifest: #{result.url_manifest_file}"
       stdout.puts "Pins manifest: #{result.pins_manifest_file}"
 
@@ -45,6 +53,11 @@ module PinterestScrapper
     private
 
     attr_reader :argv, :stdout, :stderr, :stdin, :app_factory
+
+    def report_progress(message)
+      stdout.puts message
+      stdout.flush
+    end
 
     def parse_arguments
       unless [1, 2].include?(argv.length)
