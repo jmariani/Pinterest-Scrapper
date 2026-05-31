@@ -34,7 +34,8 @@ module PinterestScrapper
       page_fetcher: PageFetcher.new,
       safari_snapshot: SafariSnapshot.new,
       image_downloader: ImageDownloader.new,
-      progress: nil
+      progress: nil,
+      stop_requested: nil
     )
       @target_folder = target_folder
       @pinterest_url = pinterest_url
@@ -43,6 +44,7 @@ module PinterestScrapper
       @safari_snapshot = safari_snapshot
       @image_downloader = image_downloader
       @progress = progress
+      @stop_requested = stop_requested
     end
 
     def run
@@ -56,6 +58,12 @@ module PinterestScrapper
       next_url = pinterest_url.to_s
 
       loop do
+        if stop_requested?
+          report_progress "Stop requested. Writing manifests and ending gracefully."
+          write_manifests(url_manifest, pins_manifest)
+          break
+        end
+
         last_scraped_page = scrape_page(next_url)
         add_pins(pins_manifest, last_scraped_page.pin_urls)
         new_image_urls = add_image_urls(url_manifest, last_scraped_page.image_original_urls)
@@ -69,6 +77,11 @@ module PinterestScrapper
         mark_pin_processed(pins_manifest, next_url)
         mark_pin_processed(pins_manifest, last_scraped_page.pin_url)
         write_manifests(url_manifest, pins_manifest)
+
+        if stop_requested?
+          report_progress "Stop requested. Ending gracefully before the next pin."
+          break
+        end
 
         next_pin = next_unprocessed_pin(pins_manifest)
         break unless next_pin
@@ -104,7 +117,8 @@ module PinterestScrapper
                 :page_fetcher,
                 :safari_snapshot,
                 :image_downloader,
-                :progress
+                :progress,
+                :stop_requested
 
     def scrape_page(url)
       report_progress "Opening Safari and collecting rendered page URLs: #{url}"
@@ -125,9 +139,18 @@ module PinterestScrapper
       progress&.call(message)
     end
 
+    def stop_requested?
+      stop_requested&.call
+    end
+
     def download_images(image_urls)
       report_progress "Downloading #{image_urls.length} original images..."
-      result = image_downloader.download_all(image_urls, target_folder, progress: progress)
+      result = image_downloader.download_all(
+        image_urls,
+        target_folder,
+        progress: progress,
+        stop_requested: method(:stop_requested?)
+      )
       report_progress "Saved #{result.saved_files.length} images. Skipped #{result.skipped_files.length}. Failed #{result.failed_urls.length}."
       result
     end

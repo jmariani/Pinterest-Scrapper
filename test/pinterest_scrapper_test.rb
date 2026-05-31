@@ -155,7 +155,7 @@ class PinterestScrapperTest < Minitest::Test
         ]
       )
       image_downloader = Struct.new(:failed_urls, :downloaded_urls) do
-        def download_all(urls, target_folder, progress: nil)
+        def download_all(urls, target_folder, progress: nil, stop_requested: nil)
           downloaded_urls.concat(urls)
           saved_files = urls.map { |url| File.join(target_folder, File.basename(URI.parse(url).path)) }
           saved_files.each_with_index do |path, index|
@@ -330,6 +330,36 @@ class PinterestScrapperTest < Minitest::Test
 
       assert_includes progress_messages, "Saved image 1/2: photo.png"
       assert_includes progress_messages, "Skipped image 2/2: photo.png"
+    end
+  end
+
+  def test_image_downloader_ends_gracefully_when_stop_is_requested
+    Dir.mktmpdir do |dir|
+      fetcher = ->(_url) { png_bytes(width: 10, height: 10, marker: "image") }
+      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher)
+      progress_messages = []
+      stop_checks = 0
+      stop_requested = lambda do
+        stop_checks += 1
+        stop_checks > 1
+      end
+      urls = [
+        "https://i.pinimg.com/originals/a/photo-a.png",
+        "https://i.pinimg.com/originals/b/photo-b.png"
+      ]
+
+      result = downloader.download_all(
+        urls,
+        dir,
+        progress: ->(message) { progress_messages << message },
+        stop_requested: stop_requested
+      )
+
+      assert_equal [File.join(dir, "photo-a.png")], result.saved_files
+      assert_empty result.skipped_files
+      assert_empty result.failed_urls
+      assert_includes progress_messages, "Stop requested. Ending downloads gracefully."
+      refute File.exist?(File.join(dir, "photo-b.png"))
     end
   end
 

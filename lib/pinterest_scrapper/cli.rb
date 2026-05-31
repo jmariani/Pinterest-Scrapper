@@ -14,29 +14,38 @@ module PinterestScrapper
       @stdout = stdout
       @stderr = stderr
       @stdin = stdin
+      @stop_requested = false
       @app_factory = app_factory || lambda do |target_folder, pinterest_url|
         App.new(
           target_folder: target_folder,
           pinterest_url: pinterest_url,
-          progress: method(:report_progress)
+          progress: method(:report_progress),
+          stop_requested: method(:stop_requested?)
         )
       end
     end
 
     def call
-      target_folder, pinterest_url = parse_arguments
-      result = app_factory.call(target_folder, pinterest_url).run
+      with_interrupt_handler do
+        target_folder, pinterest_url = parse_arguments
+        result = app_factory.call(target_folder, pinterest_url).run
 
-      stdout.puts "Target folder: #{result.target_folder}"
-      stdout.puts "Pinterest URL: #{result.pinterest_url}"
-      stdout.puts "Pin URL: #{result.pin_url}"
-      stdout.puts "Pin URLs: #{result.pin_urls.length}"
-      stdout.puts "Image original URLs: #{result.image_original_urls.length}"
-      stdout.puts "Saved images: #{result.saved_image_files.length}"
-      stdout.puts "Skipped images: #{result.skipped_image_files.length}"
-      stdout.puts "Failed images: #{result.failed_image_urls.length}"
-      stdout.puts "URL manifest: #{result.url_manifest_file}"
-      stdout.puts "Pins manifest: #{result.pins_manifest_file}"
+        stdout.puts "Target folder: #{result.target_folder}"
+        stdout.puts "Pinterest URL: #{result.pinterest_url}"
+        stdout.puts "Pin URL: #{result.pin_url}"
+        stdout.puts "Pin URLs: #{result.pin_urls.length}"
+        stdout.puts "Image original URLs: #{result.image_original_urls.length}"
+        stdout.puts "Saved images: #{result.saved_image_files.length}"
+        stdout.puts "Skipped images: #{result.skipped_image_files.length}"
+        stdout.puts "Failed images: #{result.failed_image_urls.length}"
+        stdout.puts "URL manifest: #{result.url_manifest_file}"
+        stdout.puts "Pins manifest: #{result.pins_manifest_file}"
+      end
+
+      SUCCESS
+    rescue Interrupt
+      request_stop
+      stdout.puts "Interrupt received. Ending gracefully..."
 
       SUCCESS
     rescue ArgumentError => e
@@ -53,6 +62,34 @@ module PinterestScrapper
     private
 
     attr_reader :argv, :stdout, :stderr, :stdin, :app_factory
+
+    def with_interrupt_handler
+      previous_handler = nil
+      trap_installed = false
+
+      begin
+        previous_handler = Signal.trap("INT") do
+          request_stop
+          stdout.puts "Interrupt received. Ending gracefully after the current step..."
+          stdout.flush
+        end
+        trap_installed = true
+      rescue ArgumentError
+        trap_installed = false
+      end
+
+      yield
+    ensure
+      Signal.trap("INT", previous_handler) if trap_installed
+    end
+
+    def request_stop
+      @stop_requested = true
+    end
+
+    def stop_requested?
+      @stop_requested
+    end
 
     def report_progress(message)
       stdout.puts message

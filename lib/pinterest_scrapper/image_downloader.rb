@@ -14,13 +14,18 @@ module PinterestScrapper
       @fetcher = fetcher
     end
 
-    def download_all(urls, target_folder, progress: nil)
+    def download_all(urls, target_folder, progress: nil, stop_requested: nil)
       FileUtils.mkdir_p(target_folder)
       saved_files = []
       skipped_files = []
       failed_urls = []
 
       urls.each_with_index do |url, index|
+        if stop_requested&.call
+          progress&.call("Stop requested. Ending downloads gracefully.")
+          break
+        end
+
         destination = destination_path(url, target_folder, index)
         image_body = download(url)
         action = keep_best_image(image_body, destination)

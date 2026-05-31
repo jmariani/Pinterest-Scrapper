@@ -20,6 +20,8 @@ While it runs, the command prints progress for each scroll with the original
 image URL count, pin URL count, and current stable-scroll count.
 During downloads, it also prints one progress line after each image attempt:
 saved, replaced, skipped, or failed.
+Pressing Ctrl-C requests a graceful stop. The app finishes the current safe
+step, writes the manifests, and exits without an abort stack trace.
 
 ## Usage
 
