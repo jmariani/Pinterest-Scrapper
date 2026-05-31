@@ -12,6 +12,9 @@ with the highest detected resolution.
 
 The Safari collector keeps scrolling until the rendered page stops exposing new
 original image URLs and pin URLs for several consecutive scrolls.
+After each page finishes downloading, the app takes the first unprocessed pin
+from `pins_manifest.json`, processes it, merges newly discovered unique pins
+back into the manifest, and repeats until there are no unprocessed pins left.
 
 While it runs, the command prints progress for each scroll with the original
 image URL count, pin URL count, and current stable-scroll count.

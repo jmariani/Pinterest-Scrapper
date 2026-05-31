@@ -154,9 +154,10 @@ class PinterestScrapperTest < Minitest::Test
           "https://www.pinterest.com/pin/777777777/"
         ]
       )
-      image_downloader = Struct.new(:saved_files, :failed_urls, :downloaded_urls) do
+      image_downloader = Struct.new(:failed_urls, :downloaded_urls) do
         def download_all(urls, target_folder, progress: nil)
           downloaded_urls.concat(urls)
+          saved_files = urls.map { |url| File.join(target_folder, File.basename(URI.parse(url).path)) }
           saved_files.each_with_index do |path, index|
             File.binwrite(path, "image")
             progress&.call("Saved image #{index + 1}/#{urls.length}: #{File.basename(path)}")
@@ -180,7 +181,7 @@ class PinterestScrapperTest < Minitest::Test
         File.join(dir, "ddeeff.jpg")
       ]
       downloaded_urls = []
-      image_downloader = image_downloader.new(saved_image_files, [], downloaded_urls)
+      image_downloader = image_downloader.new([], downloaded_urls)
 
       progress_messages = []
       result = PinterestScrapper::App.new(
@@ -194,13 +195,16 @@ class PinterestScrapperTest < Minitest::Test
       ).run
 
       assert_empty opened_urls
-      assert_includes progress_messages, "Opening Safari and collecting rendered page URLs..."
+      assert_includes progress_messages, "Opening Safari and collecting rendered page URLs: https://www.pinterest.com/pin/123456789/"
       assert_includes progress_messages, "scroll 1: 1 original image URLs, 1 pin URLs, stable 0/3"
       assert_includes progress_messages, "Collected 9 original image URLs and 4 pin URLs."
       assert_includes progress_messages, "Downloading 9 original images..."
       refute_includes progress_messages, "Downloading image 1/9: 00c5caec39417c90e888c676a7ea8df5.jpg"
       assert_includes progress_messages, "Saved image 9/9: ddeeff.jpg"
       assert_includes progress_messages, "Saved 9 images. Skipped 0. Failed 0."
+      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/555555555/"
+      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/777777777/"
+      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/987654321/"
       assert_equal "https://www.pinterest.com/pin/123456789/", result.pin_url
       assert_equal [
         "https://www.pinterest.com/pin/123456789/",
@@ -250,6 +254,8 @@ class PinterestScrapperTest < Minitest::Test
       assert_includes File.read(result.pins_manifest_file), "https://www.pinterest.com/pin/123456789/"
       assert_includes File.read(result.pins_manifest_file), "https://www.pinterest.com/pin/777777777/"
       assert_includes File.read(result.pins_manifest_file), "https://www.pinterest.com/pin/987654321/"
+      pins_manifest = JSON.parse(File.read(result.pins_manifest_file))
+      assert pins_manifest.fetch("pins").all? { |pin| pin.fetch("processed") }
     end
   end
 
