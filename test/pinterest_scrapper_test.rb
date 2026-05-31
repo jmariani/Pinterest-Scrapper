@@ -268,20 +268,83 @@ class PinterestScrapperTest < Minitest::Test
           png_bytes(width: 50, height: 50, marker: "small")
         end
       end
-      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher)
+      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher, workers: 1)
       urls = [
         "https://i.pinimg.com/originals/small/photo.png",
         "https://i.pinimg.com/originals/large/photo.png"
       ]
 
       result = downloader.download_all(urls, dir)
-      destination = File.join(dir, "photo.png")
+      destination = File.join(dir, "ph", "ot", "photo.png")
 
       assert_equal [destination], result.saved_files
       assert_empty result.failed_urls
       assert_includes File.binread(destination), "large"
-      refute File.exist?(File.join(dir, "photo_2.png"))
+      refute File.exist?(File.join(dir, "ph", "ot", "photo_2.png"))
     end
+  end
+
+  def test_image_downloader_uses_two_level_folder_structure_from_filename
+    Dir.mktmpdir do |dir|
+      fetcher = ->(_url) { png_bytes(width: 10, height: 10, marker: "image") }
+      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher, workers: 1)
+      url = "https://i.pinimg.com/originals/00/c5/ca/00c5caec39417c90e888c676a7ea8df5.jpg"
+
+      result = downloader.download_all([url], dir)
+      destination = File.join(dir, "00", "c5", "00c5caec39417c90e888c676a7ea8df5.jpg")
+
+      assert_equal [destination], result.saved_files
+      assert File.exist?(destination)
+    end
+  end
+
+  def test_image_downloader_downloads_in_parallel
+    Dir.mktmpdir do |dir|
+      mutex = Mutex.new
+      active_downloads = 0
+      max_active_downloads = 0
+      fetcher = lambda do |_url|
+        mutex.synchronize do
+          active_downloads += 1
+          max_active_downloads = [max_active_downloads, active_downloads].max
+        end
+        sleep 0.05
+        mutex.synchronize { active_downloads -= 1 }
+        png_bytes(width: 10, height: 10, marker: "image")
+      end
+      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher, workers: 3)
+      urls = [
+        "https://i.pinimg.com/originals/aa/aa/aa/aafile.png",
+        "https://i.pinimg.com/originals/bb/bb/bb/bbfile.png",
+        "https://i.pinimg.com/originals/cc/cc/cc/ccfile.png"
+      ]
+
+      result = downloader.download_all(urls, dir)
+
+      assert_operator max_active_downloads, :>, 1
+      assert_equal 3, result.saved_files.length
+    end
+  end
+
+  def test_image_downloader_uses_ten_workers_by_default
+    assert_equal 10, PinterestScrapper::ImageDownloader::DEFAULT_WORKERS
+  end
+
+  def test_safari_snapshot_parses_and_remembers_unique_tab_marker_output
+    snapshot = PinterestScrapper::SafariSnapshot.new
+    payload = {
+      url: "https://www.pinterest.com/pin/123/",
+      html: "<html></html>",
+      urls: []
+    }
+
+    parsed = snapshot.send(:parse_script_output, "pinterest-scrapper-test-marker\t#{JSON.generate(payload)}")
+    next_script = snapshot.send(:apple_script, "https://www.pinterest.com/pin/456/")
+
+    assert_equal payload.fetch(:url), parsed.fetch("url")
+    assert_includes next_script, "set tabMarker to \"pinterest-scrapper-test-marker\""
+    refute_includes next_script, "preferredTabIndex"
+    refute_includes next_script, "targetTabIndex"
   end
 
   def test_image_downloader_keeps_existing_image_when_new_image_has_lower_resolution
@@ -293,20 +356,20 @@ class PinterestScrapperTest < Minitest::Test
           png_bytes(width: 50, height: 50, marker: "small")
         end
       end
-      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher)
+      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher, workers: 1)
       urls = [
         "https://i.pinimg.com/originals/large/photo.png",
         "https://i.pinimg.com/originals/small/photo.png"
       ]
 
       result = downloader.download_all(urls, dir)
-      destination = File.join(dir, "photo.png")
+      destination = File.join(dir, "ph", "ot", "photo.png")
 
       assert_equal [destination], result.saved_files
       assert_equal [destination], result.skipped_files
       assert_empty result.failed_urls
       assert_includes File.binread(destination), "large"
-      refute File.exist?(File.join(dir, "photo_2.png"))
+      refute File.exist?(File.join(dir, "ph", "ot", "photo_2.png"))
     end
   end
 
@@ -319,7 +382,7 @@ class PinterestScrapperTest < Minitest::Test
           png_bytes(width: 50, height: 50, marker: "small")
         end
       end
-      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher)
+      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher, workers: 1)
       progress_messages = []
       urls = [
         "https://i.pinimg.com/originals/large/photo.png",
@@ -336,7 +399,7 @@ class PinterestScrapperTest < Minitest::Test
   def test_image_downloader_ends_gracefully_when_stop_is_requested
     Dir.mktmpdir do |dir|
       fetcher = ->(_url) { png_bytes(width: 10, height: 10, marker: "image") }
-      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher)
+      downloader = PinterestScrapper::ImageDownloader.new(fetcher: fetcher, workers: 1)
       progress_messages = []
       stop_checks = 0
       stop_requested = lambda do
@@ -355,11 +418,11 @@ class PinterestScrapperTest < Minitest::Test
         stop_requested: stop_requested
       )
 
-      assert_equal [File.join(dir, "photo-a.png")], result.saved_files
+      assert_equal [File.join(dir, "ph", "ot", "photo-a.png")], result.saved_files
       assert_empty result.skipped_files
       assert_empty result.failed_urls
       assert_includes progress_messages, "Stop requested. Ending downloads gracefully."
-      refute File.exist?(File.join(dir, "photo-b.png"))
+      refute File.exist?(File.join(dir, "ph", "ot", "photo-b.png"))
     end
   end
 

@@ -2,16 +2,19 @@
 
 require "fileutils"
 require "net/http"
+require "thread"
 require "uri"
 
 module PinterestScrapper
   class ImageDownloader
     Result = Struct.new(:saved_files, :skipped_files, :failed_urls, keyword_init: true)
 
+    DEFAULT_WORKERS = 10
     MAX_REDIRECTS = 5
 
-    def initialize(fetcher: nil)
+    def initialize(fetcher: nil, workers: DEFAULT_WORKERS)
       @fetcher = fetcher
+      @workers = workers
     end
 
     def download_all(urls, target_folder, progress: nil, stop_requested: nil)
@@ -19,36 +22,57 @@ module PinterestScrapper
       saved_files = []
       skipped_files = []
       failed_urls = []
+      results_mutex = Mutex.new
+      destination_mutexes = Hash.new { |hash, key| hash[key] = Mutex.new }
+      destination_mutexes_mutex = Mutex.new
+      jobs = Queue.new
 
-      urls.each_with_index do |url, index|
-        if stop_requested&.call
-          progress&.call("Stop requested. Ending downloads gracefully.")
-          break
+      urls.each_with_index { |url, index| jobs << [url, index] }
+
+      worker_count(urls).times.map do
+        Thread.new do
+          loop do
+            url, index = jobs.pop(true)
+            break if stop_requested&.call
+
+            destination = destination_path(url, target_folder, index)
+            destination_mutex = destination_mutexes_mutex.synchronize { destination_mutexes[destination] }
+            image_body = download(url)
+            action = destination_mutex.synchronize { keep_best_image(image_body, destination) }
+            expanded_destination = File.expand_path(destination)
+
+            results_mutex.synchronize do
+              if action == :skipped
+                skipped_files << expanded_destination
+                progress&.call("Skipped image #{index + 1}/#{urls.length}: #{File.basename(destination)}")
+              else
+                saved_files << expanded_destination
+                progress&.call("#{download_progress_action(action)} image #{index + 1}/#{urls.length}: #{File.basename(destination)}")
+              end
+            end
+          rescue ThreadError
+            break
+          rescue StandardError => e
+            results_mutex.synchronize do
+              failed_urls << url
+              progress&.call("Failed image #{index + 1}/#{urls.length}: #{File.basename(destination)} (#{e.message})")
+            end
+          end
         end
+      end.each(&:join)
 
-        destination = destination_path(url, target_folder, index)
-        image_body = download(url)
-        action = keep_best_image(image_body, destination)
-        expanded_destination = File.expand_path(destination)
-
-        if action == :skipped
-          skipped_files << expanded_destination
-          progress&.call("Skipped image #{index + 1}/#{urls.length}: #{File.basename(destination)}")
-        else
-          saved_files << expanded_destination
-          progress&.call("#{download_progress_action(action)} image #{index + 1}/#{urls.length}: #{File.basename(destination)}")
-        end
-      rescue StandardError => e
-        failed_urls << url
-        progress&.call("Failed image #{index + 1}/#{urls.length}: #{File.basename(destination)} (#{e.message})")
-      end
+      progress&.call("Stop requested. Ending downloads gracefully.") if stop_requested&.call
 
       Result.new(saved_files: saved_files.uniq, skipped_files: skipped_files.uniq, failed_urls: failed_urls)
     end
 
     private
 
-    attr_reader :fetcher
+    attr_reader :fetcher, :workers
+
+    def worker_count(urls)
+      [[workers.to_i, 1].max, urls.length].min
+    end
 
     def download(url, redirect_count: 0)
       return fetcher.call(url) if fetcher
@@ -77,12 +101,14 @@ module PinterestScrapper
       basename = File.basename(uri.path)
       basename = "image_#{index + 1}" if basename.nil? || basename.empty? || basename == "/"
 
-      File.join(target_folder, basename)
+      structured_destination_path(target_folder, basename)
     rescue URI::InvalidURIError
-      File.join(target_folder, "image_#{index + 1}")
+      structured_destination_path(target_folder, "image_#{index + 1}")
     end
 
     def keep_best_image(image_body, destination)
+      FileUtils.mkdir_p(File.dirname(destination))
+
       unless File.exist?(destination)
         File.binwrite(destination, image_body)
         return :saved
@@ -101,6 +127,18 @@ module PinterestScrapper
 
     def download_progress_action(action)
       action == :replaced ? "Replaced" : "Saved"
+    end
+
+    def structured_destination_path(target_folder, basename)
+      normalized_name = basename.to_s
+      first_level = folder_segment(normalized_name[0, 2])
+      second_level = folder_segment(normalized_name[2, 2])
+
+      File.join(target_folder, first_level, second_level, normalized_name)
+    end
+
+    def folder_segment(segment)
+      segment.to_s.downcase.ljust(2, "_")
     end
 
     def resolution_score(resolution)

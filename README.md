@@ -9,9 +9,13 @@ Original image URLs are collected from regular image URLs and `srcset`
 attributes.
 If multiple images resolve to the same filename, the downloader keeps the file
 with the highest detected resolution.
+Images are saved in a two-level folder structure using the filename prefix:
+`00c5ca...jpg` is saved as `00/c5/00c5ca...jpg`.
 
 The Safari collector keeps scrolling until the rendered page stops exposing new
 original image URLs and pin URLs for several consecutive scrolls.
+The first Safari capture marks its tab with a unique run id, and later pin
+captures find and reuse that same marked tab for the rest of the run.
 After each page finishes downloading, the app takes the first unprocessed pin
 from `pins_manifest.json`, processes it, merges newly discovered unique pins
 back into the manifest, and repeats until there are no unprocessed pins left.
@@ -20,6 +24,7 @@ While it runs, the command prints progress for each scroll with the original
 image URL count, pin URL count, and current stable-scroll count.
 During downloads, it also prints one progress line after each image attempt:
 saved, replaced, skipped, or failed.
+Images download in parallel with a 10-worker pool.
 Pressing Ctrl-C requests a graceful stop. The app finishes the current safe
 step, writes the manifests, and exits without an abort stack trace.
 

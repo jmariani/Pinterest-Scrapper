@@ -2,6 +2,7 @@
 
 require "json"
 require "open3"
+require "securerandom"
 
 module PinterestScrapper
   class SafariSnapshot
@@ -136,7 +137,7 @@ module PinterestScrapper
       stdout, stderr, status = run_script(script, progress: progress)
       raise "Safari snapshot failed: #{stderr.strip}" unless status.success?
 
-      payload = JSON.parse(stdout)
+      payload = parse_script_output(stdout)
       Snapshot.new(
         url: payload.fetch("url"),
         body: payload.fetch("html"),
@@ -147,6 +148,15 @@ module PinterestScrapper
     end
 
     private
+
+    def parse_script_output(stdout)
+      tab_marker, snapshot_json = stdout.split("\t", 2)
+      @tab_marker = tab_marker unless tab_marker.to_s.empty?
+
+      JSON.parse(snapshot_json)
+    rescue TypeError
+      JSON.parse(stdout)
+    end
 
     def run_script(script, progress:)
       stdout_data = +""
@@ -174,22 +184,51 @@ module PinterestScrapper
     end
 
     def apple_script(url)
+      @tab_marker ||= "pinterest-scrapper-#{SecureRandom.uuid}"
+
       <<~APPLESCRIPT
         log #{(PROGRESS_PREFIX + "opening Safari").to_json}
+
+        set tabMarker to #{@tab_marker.to_json}
 
         tell application "Safari"
           activate
           if (count of windows) = 0 then
             make new document with properties {URL:#{url.to_s.to_json}}
+            set targetWindow to front window
+            set targetTab to current tab of targetWindow
           else
-            set URL of current tab of front window to #{url.to_s.to_json}
+            set targetWindow to missing value
+            set targetTab to missing value
+
+            repeat with safariWindow in windows
+              repeat with safariTab in tabs of safariWindow
+                try
+                  if (do JavaScript "window.name" in safariTab) is tabMarker then
+                    set targetWindow to safariWindow
+                    set targetTab to safariTab
+                    exit repeat
+                  end if
+                end try
+              end repeat
+
+              if targetTab is not missing value then exit repeat
+            end repeat
+
+            if targetWindow is missing value then
+              set targetWindow to front window
+              set targetTab to current tab of targetWindow
+            end if
+
+            set current tab of targetWindow to targetTab
+            set URL of targetTab to #{url.to_s.to_json}
           end if
         end tell
 
         delay #{WAIT_SECONDS}
 
         tell application "Safari"
-          do JavaScript "window.__pinterestScrapperUrls = new Set();" in current tab of front window
+          do JavaScript #{("window.name = #{@tab_marker.to_json}; window.__pinterestScrapperUrls = new Set();").to_json} in targetTab
         end tell
 
         set previousUrlCount to -1
@@ -199,12 +238,12 @@ module PinterestScrapper
         repeat while stableScrollCount < #{STABLE_SCROLLS}
           set scrollNumber to scrollNumber + 1
           tell application "Safari"
-            do JavaScript "window.scrollBy(0, Math.max(document.documentElement.clientHeight, 900));" in current tab of front window
+            do JavaScript "window.scrollBy(0, Math.max(document.documentElement.clientHeight, 900));" in targetTab
           end tell
           delay #{SCROLL_WAIT_SECONDS}
 
           tell application "Safari"
-            set currentProgressJson to do JavaScript #{URL_COUNT_JAVASCRIPT.to_json} in current tab of front window
+            set currentProgressJson to do JavaScript #{URL_COUNT_JAVASCRIPT.to_json} in targetTab
           end tell
 
           set AppleScript's text item delimiters to ","
@@ -227,10 +266,10 @@ module PinterestScrapper
         log #{(PROGRESS_PREFIX + "creating final snapshot").to_json}
 
         tell application "Safari"
-          set snapshotJson to do JavaScript #{SNAPSHOT_JAVASCRIPT.to_json} in current tab of front window
+          set snapshotJson to do JavaScript #{SNAPSHOT_JAVASCRIPT.to_json} in targetTab
         end tell
 
-        return snapshotJson
+        return tabMarker & tab & snapshotJson
       APPLESCRIPT
     end
   end
