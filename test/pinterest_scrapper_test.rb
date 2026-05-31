@@ -198,6 +198,7 @@ class PinterestScrapperTest < Minitest::Test
       assert_includes progress_messages, "Opening Safari and collecting rendered page URLs: https://www.pinterest.com/pin/123456789/"
       assert_includes progress_messages, "scroll 1: 1 original image URLs, 1 pin URLs, stable 0/3"
       assert_includes progress_messages, "Collected 9 original image URLs and 4 pin URLs."
+      assert_includes progress_messages, "9 new original image URLs. 0 already in manifest."
       assert_includes progress_messages, "Downloading 9 original images..."
       refute_includes progress_messages, "Downloading image 1/9: 00c5caec39417c90e888c676a7ea8df5.jpg"
       assert_includes progress_messages, "Saved image 9/9: ddeeff.jpg"

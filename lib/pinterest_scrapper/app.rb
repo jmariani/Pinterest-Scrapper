@@ -67,6 +67,8 @@ module PinterestScrapper
         last_scraped_page = scrape_page(next_url)
         add_pins(pins_manifest, last_scraped_page.pin_urls)
         new_image_urls = add_image_urls(url_manifest, last_scraped_page.image_original_urls)
+        already_known_image_count = last_scraped_page.image_original_urls.length - new_image_urls.length
+        report_progress "#{new_image_urls.length} new original image URLs. #{already_known_image_count} already in manifest."
         write_manifests(url_manifest, pins_manifest)
 
         download_result = download_images(new_image_urls)
