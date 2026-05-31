@@ -9,10 +9,11 @@ module PinterestScrapper
     SUCCESS = 0
     ERROR = 1
 
-    def initialize(argv, stdout: $stdout, stderr: $stderr)
+    def initialize(argv, stdout: $stdout, stderr: $stderr, stdin: $stdin)
       @argv = argv
       @stdout = stdout
       @stderr = stderr
+      @stdin = stdin
     end
 
     def call
@@ -32,15 +33,23 @@ module PinterestScrapper
 
     private
 
-    attr_reader :argv, :stdout, :stderr
+    attr_reader :argv, :stdout, :stderr, :stdin
 
     def parse_arguments
-      raise ArgumentError, "expected 2 parameters, got #{argv.length}" unless argv.length == 2
+      unless [1, 2].include?(argv.length)
+        raise ArgumentError, "expected 1 or 2 parameters, got #{argv.length}"
+      end
 
       target_folder = argv[0]
-      pinterest_url = parse_pinterest_url(argv[1])
+      raw_pinterest_url = argv[1] || prompt_for_pinterest_url
+      pinterest_url = parse_pinterest_url(raw_pinterest_url)
 
       [target_folder, pinterest_url]
+    end
+
+    def prompt_for_pinterest_url
+      stdout.print "Pinterest URL: "
+      stdin.gets&.strip.to_s
     end
 
     def parse_pinterest_url(raw_url)

@@ -35,7 +35,30 @@ class PinterestScrapperTest < Minitest::Test
 
     assert_equal 1, status
     assert_empty stdout.string
-    assert_includes stderr.string, "expected 2 parameters, got 0"
+    assert_includes stderr.string, "expected 1 or 2 parameters, got 0"
+  end
+
+  def test_cli_asks_for_pinterest_url_when_second_parameter_is_missing
+    Dir.mktmpdir do |dir|
+      target_folder = File.join(dir, "downloads")
+      stdout = StringIO.new
+      stderr = StringIO.new
+      stdin = StringIO.new("https://www.pinterest.com/pin/123456789/\n")
+
+      status = PinterestScrapper::CLI.new(
+        [target_folder],
+        stdout: stdout,
+        stderr: stderr,
+        stdin: stdin
+      ).call
+
+      assert_equal 0, status
+      assert Dir.exist?(target_folder)
+      assert_includes stdout.string, "Pinterest URL: "
+      assert_includes stdout.string, "Target folder: #{target_folder}"
+      assert_includes stdout.string, "Pinterest URL: https://www.pinterest.com/pin/123456789/"
+      assert_empty stderr.string
+    end
   end
 
   def test_cli_rejects_non_pinterest_urls
