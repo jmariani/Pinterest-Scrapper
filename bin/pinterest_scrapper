@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative "../lib/pinterest_scrapper/cli"
+
+exit PinterestScrapper::CLI.new(ARGV).call
