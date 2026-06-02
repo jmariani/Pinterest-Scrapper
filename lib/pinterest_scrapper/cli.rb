@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "json"
 require "uri"
 
 require_relative "app"
@@ -102,10 +103,24 @@ module PinterestScrapper
       end
 
       target_folder = argv[0]
-      raw_pinterest_url = argv[1] || prompt_for_pinterest_url
+      raw_pinterest_url = argv[1] || first_unprocessed_pin_url(target_folder) || prompt_for_pinterest_url
       pinterest_url = parse_pinterest_url(raw_pinterest_url)
 
       [target_folder, pinterest_url]
+    end
+
+    def first_unprocessed_pin_url(target_folder)
+      manifest_file = File.join(target_folder, "pins_manifest.json")
+      return nil unless File.exist?(manifest_file)
+
+      manifest = JSON.parse(File.read(manifest_file))
+      pin = Array(manifest["pins"]).find do |entry|
+        entry.is_a?(Hash) && entry["pin_url"].to_s != "" && !entry["processed"]
+      end
+
+      pin&.fetch("pin_url")
+    rescue JSON::ParserError
+      raise ArgumentError, "Pinterest URL missing and pins manifest is invalid: #{manifest_file}"
     end
 
     def prompt_for_pinterest_url
@@ -136,7 +151,7 @@ module PinterestScrapper
     end
 
     def usage
-      "Usage: ruby bin/pinterest_scrapper TARGET_FOLDER PINTEREST_URL"
+      "Usage: ruby bin/pinterest_scrapper TARGET_FOLDER [PINTEREST_URL]"
     end
   end
 end

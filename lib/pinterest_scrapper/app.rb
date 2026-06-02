@@ -56,6 +56,8 @@ module PinterestScrapper
       failed_image_urls = []
       last_scraped_page = nil
       next_url = pinterest_url.to_s
+      pending_pin_urls = []
+      add_seed_pin(pins_manifest, next_url)
 
       loop do
         if stop_requested?
@@ -65,7 +67,9 @@ module PinterestScrapper
         end
 
         last_scraped_page = scrape_page(next_url)
-        add_pins(pins_manifest, last_scraped_page.pin_urls)
+        newly_discovered_pin_urls = new_pin_urls(pins_manifest, pending_pin_urls, last_scraped_page.pin_urls)
+        pending_pin_urls.concat(newly_discovered_pin_urls)
+        report_progress "#{newly_discovered_pin_urls.length} new pin URLs queued for future runs." if newly_discovered_pin_urls.any?
         new_image_urls = add_image_urls(url_manifest, last_scraped_page.image_original_urls)
         already_known_image_count = last_scraped_page.image_original_urls.length - new_image_urls.length
         report_progress "#{new_image_urls.length} new original image URLs. #{already_known_image_count} already in manifest."
@@ -91,6 +95,10 @@ module PinterestScrapper
         next_url = next_pin.fetch("pin_url")
         report_progress "Processing next pin: #{next_url}"
       end
+
+      add_pins(pins_manifest, pending_pin_urls)
+      report_progress "Added #{pending_pin_urls.length} new pins to manifest for future runs." if pending_pin_urls.any?
+      write_manifests(url_manifest, pins_manifest)
 
       manifest_files = manifest_file_paths
       image_original_urls = url_manifest.fetch("image_original_urls")
@@ -203,6 +211,17 @@ module PinterestScrapper
         known_pin_urls << pin_url
       end
       pins_manifest["pins"] = unique_pins(pins_manifest.fetch("pins"))
+    end
+
+    def add_seed_pin(pins_manifest, pin_url)
+      return if pins_manifest.fetch("pins").any? { |pin| pin.fetch("pin_url") == pin_url }
+
+      pins_manifest.fetch("pins") << { "pin_url" => pin_url, "processed" => false }
+    end
+
+    def new_pin_urls(pins_manifest, pending_pin_urls, pin_urls)
+      known_pin_urls = pins_manifest.fetch("pins").map { |pin| pin.fetch("pin_url") }
+      pin_urls.reject { |pin_url| known_pin_urls.include?(pin_url) || pending_pin_urls.include?(pin_url) }
     end
 
     def mark_pin_processed(pins_manifest, pin_url)

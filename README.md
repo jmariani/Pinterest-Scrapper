@@ -16,9 +16,9 @@ The Safari collector keeps scrolling until the rendered page stops exposing new
 original image URLs and pin URLs for several consecutive scrolls.
 The first Safari capture marks its tab with a unique run id, and later pin
 captures find and reuse that same marked tab for the rest of the run.
-After each page finishes downloading, the app takes the first unprocessed pin
-from `pins_manifest.json`, processes it, merges newly discovered unique pins
-back into the manifest, and repeats until there are no unprocessed pins left.
+The app processes the unprocessed pins already present in `pins_manifest.json`.
+Pins discovered during that pass are held aside, then appended to the manifest
+as unprocessed only after the current manifest queue is finished.
 
 While it runs, the command prints progress for each scroll with the original
 image URL count, pin URL count, and current stable-scroll count.
@@ -34,9 +34,18 @@ step, writes the manifests, and exits without an abort stack trace.
 ruby bin/pinterest_scrapper ./downloads https://www.pinterest.com/pin/123456789/
 ```
 
+To resume from the first unprocessed pin in `pins_manifest.json`, omit the URL:
+
+```sh
+ruby bin/pinterest_scrapper ./downloads
+```
+
+If no manifest exists, or every pin in the manifest is already processed, the
+app prompts for a Pinterest URL.
+
 The app validates that:
 
-- exactly two parameters are provided
+- one or two parameters are provided
 - the Pinterest URL uses `http` or `https`
 - the URL host is `pinterest.com` or one of its subdomains
 

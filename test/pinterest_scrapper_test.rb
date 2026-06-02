@@ -68,13 +68,50 @@ class PinterestScrapperTest < Minitest::Test
     assert_includes stderr.string, "expected 1 or 2 parameters, got 0"
   end
 
-  def test_cli_asks_for_pinterest_url_when_second_parameter_is_missing
+  def test_cli_uses_first_unprocessed_pin_when_second_parameter_is_missing
     Dir.mktmpdir do |dir|
       target_folder = File.join(dir, "downloads")
+      Dir.mkdir(target_folder)
+      File.write(
+        File.join(target_folder, "pins_manifest.json"),
+        JSON.pretty_generate(
+          "pins" => [
+            { "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => true },
+            { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false },
+            { "pin_url" => "https://www.pinterest.com/pin/333333333/", "processed" => false }
+          ]
+        )
+      )
       stdout = StringIO.new
       stderr = StringIO.new
-      stdin = StringIO.new("https://www.pinterest.com/pin/123456789/\n")
-      app_factory = fake_app_factory(target_folder, "https://www.pinterest.com/pin/123456789/")
+      app_factory = fake_app_factory(target_folder, "https://www.pinterest.com/pin/222222222/")
+
+      status = PinterestScrapper::CLI.new(
+        [target_folder],
+        stdout: stdout,
+        stderr: stderr,
+        app_factory: app_factory
+      ).call
+
+      assert_equal 0, status
+      assert_includes stdout.string, "Target folder: #{target_folder}"
+      assert_includes stdout.string, "Pinterest URL: https://www.pinterest.com/pin/222222222/"
+      assert_empty stderr.string
+    end
+  end
+
+  def test_cli_prompts_when_second_parameter_is_missing_and_no_unprocessed_pin_exists
+    Dir.mktmpdir do |dir|
+      target_folder = File.join(dir, "downloads")
+      Dir.mkdir(target_folder)
+      File.write(
+        File.join(target_folder, "pins_manifest.json"),
+        JSON.pretty_generate("pins" => [{ "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => true }])
+      )
+      stdout = StringIO.new
+      stderr = StringIO.new
+      stdin = StringIO.new("https://www.pinterest.com/pin/222222222/\n")
+      app_factory = fake_app_factory(target_folder, "https://www.pinterest.com/pin/222222222/")
 
       status = PinterestScrapper::CLI.new(
         [target_folder],
@@ -86,8 +123,31 @@ class PinterestScrapperTest < Minitest::Test
 
       assert_equal 0, status
       assert_includes stdout.string, "Pinterest URL: "
-      assert_includes stdout.string, "Target folder: #{target_folder}"
-      assert_includes stdout.string, "Pinterest URL: https://www.pinterest.com/pin/123456789/"
+      assert_includes stdout.string, "Pinterest URL: https://www.pinterest.com/pin/222222222/"
+      assert_empty stderr.string
+    end
+  end
+
+  def test_cli_prompts_when_second_parameter_is_missing_and_no_manifest_exists
+    Dir.mktmpdir do |dir|
+      target_folder = File.join(dir, "downloads")
+      Dir.mkdir(target_folder)
+      stdout = StringIO.new
+      stderr = StringIO.new
+      stdin = StringIO.new("https://www.pinterest.com/pin/222222222/\n")
+      app_factory = fake_app_factory(target_folder, "https://www.pinterest.com/pin/222222222/")
+
+      status = PinterestScrapper::CLI.new(
+        [target_folder],
+        stdout: stdout,
+        stderr: stderr,
+        stdin: stdin,
+        app_factory: app_factory
+      ).call
+
+      assert_equal 0, status
+      assert_includes stdout.string, "Pinterest URL: "
+      assert_includes stdout.string, "Pinterest URL: https://www.pinterest.com/pin/222222222/"
       assert_empty stderr.string
     end
   end
@@ -198,14 +258,16 @@ class PinterestScrapperTest < Minitest::Test
       assert_includes progress_messages, "Opening Safari and collecting rendered page URLs: https://www.pinterest.com/pin/123456789/"
       assert_includes progress_messages, "scroll 1: 1 original image URLs, 1 pin URLs, stable 0/3"
       assert_includes progress_messages, "Collected 9 original image URLs and 4 pin URLs."
+      assert_includes progress_messages, "3 new pin URLs queued for future runs."
       assert_includes progress_messages, "9 new original image URLs. 0 already in manifest."
       assert_includes progress_messages, "Downloading 9 original images..."
       refute_includes progress_messages, "Downloading image 1/9: 00c5caec39417c90e888c676a7ea8df5.jpg"
       assert_includes progress_messages, "Saved image 9/9: ddeeff.jpg"
       assert_includes progress_messages, "Saved 9 images. Skipped 0. Failed 0."
-      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/555555555/"
-      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/777777777/"
-      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/987654321/"
+      assert_includes progress_messages, "Added 3 new pins to manifest for future runs."
+      refute_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/555555555/"
+      refute_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/777777777/"
+      refute_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/987654321/"
       assert_equal "https://www.pinterest.com/pin/123456789/", result.pin_url
       assert_equal [
         "https://www.pinterest.com/pin/123456789/",
@@ -256,7 +318,14 @@ class PinterestScrapperTest < Minitest::Test
       assert_includes File.read(result.pins_manifest_file), "https://www.pinterest.com/pin/777777777/"
       assert_includes File.read(result.pins_manifest_file), "https://www.pinterest.com/pin/987654321/"
       pins_manifest = JSON.parse(File.read(result.pins_manifest_file))
-      assert pins_manifest.fetch("pins").all? { |pin| pin.fetch("processed") }
+      processed_pins = pins_manifest.fetch("pins").select { |pin| pin.fetch("processed") }
+      unprocessed_pins = pins_manifest.fetch("pins").reject { |pin| pin.fetch("processed") }
+      assert_equal ["https://www.pinterest.com/pin/123456789/"], processed_pins.map { |pin| pin.fetch("pin_url") }
+      assert_equal [
+        "https://www.pinterest.com/pin/555555555/",
+        "https://www.pinterest.com/pin/777777777/",
+        "https://www.pinterest.com/pin/987654321/"
+      ], unprocessed_pins.map { |pin| pin.fetch("pin_url") }
     end
   end
 
