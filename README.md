@@ -25,8 +25,12 @@ image URL count, pin URL count, and current stable-scroll count.
 During downloads, it also prints one progress line after each image attempt:
 saved, replaced, skipped, or failed.
 Images download in parallel with a 10-worker pool.
+If macOS reports the screen session as locked, the app pauses before Safari
+collection, during Safari scrolling, and before downloads, then resumes after
+the machine is unlocked.
 Pressing Ctrl-C requests a graceful stop. The app finishes the current safe
-step, writes the manifests, and exits without an abort stack trace.
+step, marks the current pin as interrupted if it has not finished, writes the
+manifests, and exits without an abort stack trace.
 
 ## Usage
 
@@ -34,7 +38,8 @@ step, writes the manifests, and exits without an abort stack trace.
 ruby bin/pinterest_scrapper ./downloads https://www.pinterest.com/pin/123456789/
 ```
 
-To resume from the first unprocessed pin in `pins_manifest.json`, omit the URL:
+To resume from `pins_manifest.json`, omit the URL. The app first retries an
+interrupted pin if one exists; otherwise it chooses a random unprocessed pin:
 
 ```sh
 ruby bin/pinterest_scrapper ./downloads

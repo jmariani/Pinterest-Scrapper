@@ -10,11 +10,12 @@ module PinterestScrapper
     SUCCESS = 0
     ERROR = 1
 
-    def initialize(argv, stdout: $stdout, stderr: $stderr, stdin: $stdin, app_factory: nil)
+    def initialize(argv, stdout: $stdout, stderr: $stderr, stdin: $stdin, app_factory: nil, random: Random.new)
       @argv = argv
       @stdout = stdout
       @stderr = stderr
       @stdin = stdin
+      @random = random
       @stop_requested = false
       @app_factory = app_factory || lambda do |target_folder, pinterest_url|
         App.new(
@@ -62,7 +63,7 @@ module PinterestScrapper
 
     private
 
-    attr_reader :argv, :stdout, :stderr, :stdin, :app_factory
+    attr_reader :argv, :stdout, :stderr, :stdin, :app_factory, :random
 
     def with_interrupt_handler
       previous_handler = nil
@@ -103,22 +104,28 @@ module PinterestScrapper
       end
 
       target_folder = argv[0]
-      raw_pinterest_url = argv[1] || first_unprocessed_pin_url(target_folder) || prompt_for_pinterest_url
+      raw_pinterest_url = argv[1] || manifest_pin_url(target_folder) || prompt_for_pinterest_url
       pinterest_url = parse_pinterest_url(raw_pinterest_url)
 
       [target_folder, pinterest_url]
     end
 
-    def first_unprocessed_pin_url(target_folder)
+    def manifest_pin_url(target_folder)
       manifest_file = File.join(target_folder, "pins_manifest.json")
       return nil unless File.exist?(manifest_file)
 
       manifest = JSON.parse(File.read(manifest_file))
-      pin = Array(manifest["pins"]).find do |entry|
-        entry.is_a?(Hash) && entry["pin_url"].to_s != "" && !entry["processed"]
+      pins = Array(manifest["pins"]).select { |entry| entry.is_a?(Hash) && entry["pin_url"].to_s != "" && !entry["processed"] }
+      interrupted_pin = pins.find { |entry| entry["interrupted"] }
+      return interrupted_pin.fetch("pin_url") if interrupted_pin
+
+      pin_urls = pins.map do |entry|
+        entry.fetch("pin_url")
       end
 
-      pin&.fetch("pin_url")
+      return nil if pin_urls.empty?
+
+      pin_urls.fetch(random.rand(pin_urls.length))
     rescue JSON::ParserError
       raise ArgumentError, "Pinterest URL missing and pins manifest is invalid: #{manifest_file}"
     end

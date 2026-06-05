@@ -28,6 +28,12 @@ class PinterestScrapperTest < Minitest::Test
     end
   end
 
+  FixedRandom = Struct.new(:value) do
+    def rand(_limit)
+      value
+    end
+  end
+
   def test_cli_accepts_target_folder_and_pinterest_url
     Dir.mktmpdir do |dir|
       target_folder = File.join(dir, "downloads")
@@ -68,7 +74,7 @@ class PinterestScrapperTest < Minitest::Test
     assert_includes stderr.string, "expected 1 or 2 parameters, got 0"
   end
 
-  def test_cli_uses_first_unprocessed_pin_when_second_parameter_is_missing
+  def test_cli_uses_random_unprocessed_pin_when_second_parameter_is_missing
     Dir.mktmpdir do |dir|
       target_folder = File.join(dir, "downloads")
       Dir.mkdir(target_folder)
@@ -84,17 +90,50 @@ class PinterestScrapperTest < Minitest::Test
       )
       stdout = StringIO.new
       stderr = StringIO.new
+      app_factory = fake_app_factory(target_folder, "https://www.pinterest.com/pin/333333333/")
+
+      status = PinterestScrapper::CLI.new(
+        [target_folder],
+        stdout: stdout,
+        stderr: stderr,
+        app_factory: app_factory,
+        random: FixedRandom.new(1)
+      ).call
+
+      assert_equal 0, status
+      assert_includes stdout.string, "Target folder: #{target_folder}"
+      assert_includes stdout.string, "Pinterest URL: https://www.pinterest.com/pin/333333333/"
+      assert_empty stderr.string
+    end
+  end
+
+  def test_cli_uses_interrupted_pin_before_random_unprocessed_pin_when_second_parameter_is_missing
+    Dir.mktmpdir do |dir|
+      target_folder = File.join(dir, "downloads")
+      Dir.mkdir(target_folder)
+      File.write(
+        File.join(target_folder, "pins_manifest.json"),
+        JSON.pretty_generate(
+          "pins" => [
+            { "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => false },
+            { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false, "interrupted" => true },
+            { "pin_url" => "https://www.pinterest.com/pin/333333333/", "processed" => false }
+          ]
+        )
+      )
+      stdout = StringIO.new
+      stderr = StringIO.new
       app_factory = fake_app_factory(target_folder, "https://www.pinterest.com/pin/222222222/")
 
       status = PinterestScrapper::CLI.new(
         [target_folder],
         stdout: stdout,
         stderr: stderr,
-        app_factory: app_factory
+        app_factory: app_factory,
+        random: FixedRandom.new(2)
       ).call
 
       assert_equal 0, status
-      assert_includes stdout.string, "Target folder: #{target_folder}"
       assert_includes stdout.string, "Pinterest URL: https://www.pinterest.com/pin/222222222/"
       assert_empty stderr.string
     end
@@ -326,6 +365,105 @@ class PinterestScrapperTest < Minitest::Test
         "https://www.pinterest.com/pin/777777777/",
         "https://www.pinterest.com/pin/987654321/"
       ], unprocessed_pins.map { |pin| pin.fetch("pin_url") }
+    end
+  end
+
+  def test_app_pauses_when_machine_is_locked
+    Dir.mktmpdir do |dir|
+      page_fetcher = Struct.new(:body) do
+        def fetch(url)
+          PinterestScrapper::PageFetcher::Page.new(url: url.to_s, body: body)
+        end
+      end.new("<html></html>")
+      safari_snapshot = Struct.new(:captures) do
+        def capture(url, progress: nil)
+          captures << url.to_s
+          PinterestScrapper::SafariSnapshot::Snapshot.new(
+            url: url.to_s,
+            body: "<link rel=\"canonical\" href=\"#{url}\">",
+            urls: []
+          )
+        end
+      end.new([])
+      image_downloader = Struct.new(:download_calls) do
+        def download_all(_urls, _target_folder, progress: nil, stop_requested: nil)
+          download_calls << true
+          PinterestScrapper::ImageDownloader::Result.new(
+            saved_files: [],
+            skipped_files: [],
+            failed_urls: []
+          )
+        end
+      end.new([])
+      session_lock = Struct.new(:states) do
+        def locked?
+          states.empty? ? false : states.shift
+        end
+      end.new([true, false, true, false])
+      progress_messages = []
+
+      PinterestScrapper::App.new(
+        target_folder: dir,
+        pinterest_url: URI.parse("https://www.pinterest.com/pin/123456789/"),
+        page_fetcher: page_fetcher,
+        safari_snapshot: safari_snapshot,
+        image_downloader: image_downloader,
+        session_lock: session_lock,
+        lock_check_interval: 0,
+        progress: ->(message) { progress_messages << message }
+      ).run
+
+      assert_equal ["https://www.pinterest.com/pin/123456789/"], safari_snapshot.captures
+      assert_equal [true], image_downloader.download_calls
+      assert_equal 2, progress_messages.count("Machine is locked. Pausing until it is unlocked...")
+      assert_equal 2, progress_messages.count("Machine unlocked. Resuming...")
+    end
+  end
+
+  def test_app_leaves_current_pin_unprocessed_when_stop_is_requested_during_downloads
+    Dir.mktmpdir do |dir|
+      page_fetcher = Struct.new(:body) do
+        def fetch(url)
+          PinterestScrapper::PageFetcher::Page.new(url: url.to_s, body: body)
+        end
+      end.new("<html></html>")
+      safari_snapshot = Struct.new(:body) do
+        def capture(url, progress: nil)
+          PinterestScrapper::SafariSnapshot::Snapshot.new(url: url.to_s, body: body, urls: [])
+        end
+      end.new(<<~HTML)
+        <link rel="canonical" href="https://www.pinterest.com/pin/123456789/">
+        <img src="https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg">
+      HTML
+      stop_state = { requested: false }
+      image_downloader = Struct.new(:stop_state) do
+        def download_all(urls, target_folder, progress: nil, stop_requested: nil)
+          stop_state[:requested] = true
+          PinterestScrapper::ImageDownloader::Result.new(
+            saved_files: [],
+            skipped_files: [],
+            failed_urls: []
+          )
+        end
+      end.new(stop_state)
+      progress_messages = []
+
+      result = PinterestScrapper::App.new(
+        target_folder: dir,
+        pinterest_url: URI.parse("https://www.pinterest.com/pin/123456789/"),
+        page_fetcher: page_fetcher,
+        safari_snapshot: safari_snapshot,
+        image_downloader: image_downloader,
+        progress: ->(message) { progress_messages << message },
+        stop_requested: -> { stop_state[:requested] }
+      ).run
+
+      pins_manifest = JSON.parse(File.read(result.pins_manifest_file))
+
+      assert_includes progress_messages, "Stop requested. Marking current pin as interrupted."
+      assert_equal [
+        { "pin_url" => "https://www.pinterest.com/pin/123456789/", "processed" => false, "interrupted" => true }
+      ], pins_manifest.fetch("pins")
     end
   end
 

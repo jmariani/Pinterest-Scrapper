@@ -4,6 +4,8 @@ require "json"
 require "open3"
 require "securerandom"
 
+require_relative "session_lock"
+
 module PinterestScrapper
   class SafariSnapshot
     Snapshot = Struct.new(:url, :body, :urls, keyword_init: true)
@@ -187,6 +189,33 @@ module PinterestScrapper
       @tab_marker ||= "pinterest-scrapper-#{SecureRandom.uuid}"
 
       <<~APPLESCRIPT
+        on pinterestScrapperSessionLocked()
+          try
+            set lockState to do shell script "/usr/sbin/ioreg -n Root -d1 2>/dev/null | /usr/bin/grep -E '\\\"CGSSessionScreenIsLocked\\\"[[:space:]]*=[[:space:]]*Yes' >/dev/null && echo locked || echo unlocked"
+            return lockState is "locked"
+          on error
+            return false
+          end try
+        end pinterestScrapperSessionLocked
+
+        on pinterestScrapperWaitUntilUnlocked()
+          set reportedLocked to false
+
+          repeat while pinterestScrapperSessionLocked()
+            if reportedLocked is false then
+              log #{(PROGRESS_PREFIX + "Machine is locked. Pausing until it is unlocked...").to_json}
+              set reportedLocked to true
+            end if
+
+            delay #{SessionLock::CHECK_INTERVAL_SECONDS}
+          end repeat
+
+          if reportedLocked is true then
+            log #{(PROGRESS_PREFIX + "Machine unlocked. Resuming...").to_json}
+          end if
+        end pinterestScrapperWaitUntilUnlocked
+
+        pinterestScrapperWaitUntilUnlocked()
         log #{(PROGRESS_PREFIX + "opening Safari").to_json}
 
         set tabMarker to #{@tab_marker.to_json}
@@ -236,6 +265,7 @@ module PinterestScrapper
         set scrollNumber to 0
 
         repeat while stableScrollCount < #{STABLE_SCROLLS}
+          pinterestScrapperWaitUntilUnlocked()
           set scrollNumber to scrollNumber + 1
           tell application "Safari"
             do JavaScript "window.scrollBy(0, Math.max(document.documentElement.clientHeight, 900));" in targetTab
@@ -263,6 +293,7 @@ module PinterestScrapper
           log #{PROGRESS_PREFIX.to_json} & "scroll " & scrollNumber & ": " & currentOriginalCount & " original image URLs, " & currentPinCount & " pin URLs, stable " & stableScrollCount & "/#{STABLE_SCROLLS}"
         end repeat
 
+        pinterestScrapperWaitUntilUnlocked()
         log #{(PROGRESS_PREFIX + "creating final snapshot").to_json}
 
         tell application "Safari"

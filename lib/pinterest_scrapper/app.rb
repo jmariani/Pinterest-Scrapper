@@ -9,6 +9,7 @@ require_relative "image_downloader"
 require_relative "page_fetcher"
 require_relative "safari_snapshot"
 require_relative "scraper"
+require_relative "session_lock"
 
 module PinterestScrapper
   class App
@@ -34,6 +35,8 @@ module PinterestScrapper
       page_fetcher: PageFetcher.new,
       safari_snapshot: SafariSnapshot.new,
       image_downloader: ImageDownloader.new,
+      session_lock: SessionLock.new,
+      lock_check_interval: SessionLock::CHECK_INTERVAL_SECONDS,
       progress: nil,
       stop_requested: nil
     )
@@ -43,6 +46,8 @@ module PinterestScrapper
       @page_fetcher = page_fetcher
       @safari_snapshot = safari_snapshot
       @image_downloader = image_downloader
+      @session_lock = session_lock
+      @lock_check_interval = lock_check_interval
       @progress = progress
       @stop_requested = stop_requested
     end
@@ -66,6 +71,7 @@ module PinterestScrapper
           break
         end
 
+        wait_until_unlocked
         last_scraped_page = scrape_page(next_url)
         newly_discovered_pin_urls = new_pin_urls(pins_manifest, pending_pin_urls, last_scraped_page.pin_urls)
         pending_pin_urls.concat(newly_discovered_pin_urls)
@@ -75,10 +81,19 @@ module PinterestScrapper
         report_progress "#{new_image_urls.length} new original image URLs. #{already_known_image_count} already in manifest."
         write_manifests(url_manifest, pins_manifest)
 
+        wait_until_unlocked
         download_result = download_images(new_image_urls)
         saved_image_files.concat(download_result.saved_files)
         skipped_image_files.concat(download_result.skipped_files)
         failed_image_urls.concat(download_result.failed_urls)
+
+        if stop_requested?
+          mark_pin_interrupted(pins_manifest, next_url)
+          mark_pin_interrupted(pins_manifest, last_scraped_page.pin_url)
+          report_progress "Stop requested. Marking current pin as interrupted."
+          write_manifests(url_manifest, pins_manifest)
+          break
+        end
 
         mark_pin_processed(pins_manifest, next_url)
         mark_pin_processed(pins_manifest, last_scraped_page.pin_url)
@@ -127,8 +142,27 @@ module PinterestScrapper
                 :page_fetcher,
                 :safari_snapshot,
                 :image_downloader,
+                :session_lock,
+                :lock_check_interval,
                 :progress,
                 :stop_requested
+
+    def wait_until_unlocked
+      reported_locked = false
+
+      while session_lock.locked?
+        unless reported_locked
+          report_progress "Machine is locked. Pausing until it is unlocked..."
+          reported_locked = true
+        end
+
+        return if stop_requested?
+
+        sleep lock_check_interval
+      end
+
+      report_progress "Machine unlocked. Resuming..." if reported_locked
+    end
 
     def scrape_page(url)
       report_progress "Opening Safari and collecting rendered page URLs: #{url}"
@@ -185,7 +219,11 @@ module PinterestScrapper
         pin_url = pin.is_a?(Hash) ? pin["pin_url"] : pin.to_s
         next if pin_url.nil? || pin_url.empty?
 
-        { "pin_url" => pin_url, "processed" => pin.is_a?(Hash) ? !!pin["processed"] : false }
+        {
+          "pin_url" => pin_url,
+          "processed" => pin.is_a?(Hash) ? !!pin["processed"] : false,
+          "interrupted" => pin.is_a?(Hash) ? !!pin["interrupted"] : false
+        }
       end
 
       { "pins" => unique_pins(pins) }
@@ -207,7 +245,7 @@ module PinterestScrapper
       pin_urls.each do |pin_url|
         next if known_pin_urls.include?(pin_url)
 
-        pins_manifest.fetch("pins") << { "pin_url" => pin_url, "processed" => false }
+        pins_manifest.fetch("pins") << { "pin_url" => pin_url, "processed" => false, "interrupted" => false }
         known_pin_urls << pin_url
       end
       pins_manifest["pins"] = unique_pins(pins_manifest.fetch("pins"))
@@ -216,7 +254,7 @@ module PinterestScrapper
     def add_seed_pin(pins_manifest, pin_url)
       return if pins_manifest.fetch("pins").any? { |pin| pin.fetch("pin_url") == pin_url }
 
-      pins_manifest.fetch("pins") << { "pin_url" => pin_url, "processed" => false }
+      pins_manifest.fetch("pins") << { "pin_url" => pin_url, "processed" => false, "interrupted" => false }
     end
 
     def new_pin_urls(pins_manifest, pending_pin_urls, pin_urls)
@@ -226,19 +264,34 @@ module PinterestScrapper
 
     def mark_pin_processed(pins_manifest, pin_url)
       pins_manifest.fetch("pins").each do |pin|
-        pin["processed"] = true if pin.fetch("pin_url") == pin_url
+        next unless pin.fetch("pin_url") == pin_url
+
+        pin["processed"] = true
+        pin["interrupted"] = false
+      end
+    end
+
+    def mark_pin_interrupted(pins_manifest, pin_url)
+      pins_manifest.fetch("pins").each do |pin|
+        next unless pin.fetch("pin_url") == pin_url
+
+        pin["processed"] = false
+        pin["interrupted"] = true
       end
     end
 
     def next_unprocessed_pin(pins_manifest)
-      pins_manifest.fetch("pins").find { |pin| !pin["processed"] }
+      pins_manifest.fetch("pins").find { |pin| !pin["processed"] && pin["interrupted"] } ||
+        pins_manifest.fetch("pins").find { |pin| !pin["processed"] }
     end
 
     def unique_pins(pins)
       pins.each_with_object({}) do |pin, unique|
         pin_url = pin.fetch("pin_url")
-        unique[pin_url] ||= { "pin_url" => pin_url, "processed" => false }
+        unique[pin_url] ||= { "pin_url" => pin_url, "processed" => false, "interrupted" => false }
         unique[pin_url]["processed"] ||= !!pin["processed"]
+        unique[pin_url]["interrupted"] ||= !!pin["interrupted"]
+        unique[pin_url]["interrupted"] = false if unique[pin_url]["processed"]
       end.values
     end
 
