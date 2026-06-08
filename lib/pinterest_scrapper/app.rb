@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "fileutils"
-require "json"
 require "uri"
 
 require_relative "browser_opener"
@@ -10,6 +9,7 @@ require_relative "page_fetcher"
 require_relative "safari_snapshot"
 require_relative "scraper"
 require_relative "session_lock"
+require_relative "sqlite_store"
 
 module PinterestScrapper
   class App
@@ -23,8 +23,7 @@ module PinterestScrapper
       :saved_image_files,
       :skipped_image_files,
       :failed_image_urls,
-      :url_manifest_file,
-      :pins_manifest_file,
+      :sqlite_database_file,
       keyword_init: true
     )
 
@@ -37,6 +36,7 @@ module PinterestScrapper
       image_downloader: ImageDownloader.new,
       session_lock: SessionLock.new,
       lock_check_interval: SessionLock::CHECK_INTERVAL_SECONDS,
+      sqlite_store: nil,
       progress: nil,
       stop_requested: nil
     )
@@ -48,12 +48,14 @@ module PinterestScrapper
       @image_downloader = image_downloader
       @session_lock = session_lock
       @lock_check_interval = lock_check_interval
+      @sqlite_store = sqlite_store || SQLiteStore.new(target_folder: target_folder)
       @progress = progress
       @stop_requested = stop_requested
     end
 
     def run
       FileUtils.mkdir_p(target_folder)
+      sqlite_store.setup
       url_manifest = load_url_manifest
       pins_manifest = load_pins_manifest
       saved_image_files = []
@@ -66,8 +68,8 @@ module PinterestScrapper
 
       loop do
         if stop_requested?
-          report_progress "Stop requested. Writing manifests and ending gracefully."
-          write_manifests(url_manifest, pins_manifest)
+          report_progress "Stop requested. Writing database and ending gracefully."
+          write_state(url_manifest, pins_manifest)
           break
         end
 
@@ -78,8 +80,8 @@ module PinterestScrapper
         report_progress "#{newly_discovered_pin_urls.length} new pin URLs queued for future runs." if newly_discovered_pin_urls.any?
         new_image_urls = add_image_urls(url_manifest, last_scraped_page.image_original_urls)
         already_known_image_count = last_scraped_page.image_original_urls.length - new_image_urls.length
-        report_progress "#{new_image_urls.length} new original image URLs. #{already_known_image_count} already in manifest."
-        write_manifests(url_manifest, pins_manifest)
+        report_progress "#{new_image_urls.length} new original image URLs. #{already_known_image_count} already in database."
+        write_state(url_manifest, pins_manifest)
 
         wait_until_unlocked
         download_result = download_images(new_image_urls)
@@ -91,13 +93,13 @@ module PinterestScrapper
           mark_pin_interrupted(pins_manifest, next_url)
           mark_pin_interrupted(pins_manifest, last_scraped_page.pin_url)
           report_progress "Stop requested. Marking current pin as interrupted."
-          write_manifests(url_manifest, pins_manifest)
+          write_state(url_manifest, pins_manifest)
           break
         end
 
         mark_pin_processed(pins_manifest, next_url)
         mark_pin_processed(pins_manifest, last_scraped_page.pin_url)
-        write_manifests(url_manifest, pins_manifest)
+        write_state(url_manifest, pins_manifest)
 
         if stop_requested?
           report_progress "Stop requested. Ending gracefully before the next pin."
@@ -112,10 +114,9 @@ module PinterestScrapper
       end
 
       add_pins(pins_manifest, pending_pin_urls)
-      report_progress "Added #{pending_pin_urls.length} new pins to manifest for future runs." if pending_pin_urls.any?
-      write_manifests(url_manifest, pins_manifest)
+      report_progress "Added #{pending_pin_urls.length} new pins to database for future runs." if pending_pin_urls.any?
+      write_state(url_manifest, pins_manifest)
 
-      manifest_files = manifest_file_paths
       image_original_urls = url_manifest.fetch("image_original_urls")
       pin_urls = pins_manifest.fetch("pins").map { |pin| pin.fetch("pin_url") }
 
@@ -129,8 +130,7 @@ module PinterestScrapper
         saved_image_files: saved_image_files.uniq,
         skipped_image_files: skipped_image_files.uniq,
         failed_image_urls: failed_image_urls,
-        url_manifest_file: manifest_files.fetch(:url_manifest_file),
-        pins_manifest_file: manifest_files.fetch(:pins_manifest_file)
+        sqlite_database_file: sqlite_store.database_file
       )
     end
 
@@ -144,6 +144,7 @@ module PinterestScrapper
                 :image_downloader,
                 :session_lock,
                 :lock_check_interval,
+                :sqlite_store,
                 :progress,
                 :stop_requested
 
@@ -200,35 +201,11 @@ module PinterestScrapper
     end
 
     def load_url_manifest
-      path = manifest_file_paths.fetch(:url_manifest_file)
-      return { "urls" => [], "image_original_urls" => [] } unless File.exist?(path)
-
-      manifest = JSON.parse(File.read(path))
-      image_urls = Array(manifest["image_original_urls"] || manifest["urls"]).uniq.sort
-      { "urls" => image_urls, "image_original_urls" => image_urls }
-    rescue JSON::ParserError
-      { "urls" => [], "image_original_urls" => [] }
+      sqlite_store.load_url_manifest
     end
 
     def load_pins_manifest
-      path = manifest_file_paths.fetch(:pins_manifest_file)
-      return { "pins" => [] } unless File.exist?(path)
-
-      manifest = JSON.parse(File.read(path))
-      pins = Array(manifest["pins"]).filter_map do |pin|
-        pin_url = pin.is_a?(Hash) ? pin["pin_url"] : pin.to_s
-        next if pin_url.nil? || pin_url.empty?
-
-        {
-          "pin_url" => pin_url,
-          "processed" => pin.is_a?(Hash) ? !!pin["processed"] : false,
-          "interrupted" => pin.is_a?(Hash) ? !!pin["interrupted"] : false
-        }
-      end
-
-      { "pins" => unique_pins(pins) }
-    rescue JSON::ParserError
-      { "pins" => [] }
+      sqlite_store.load_pins_manifest
     end
 
     def add_image_urls(url_manifest, image_urls)
@@ -295,21 +272,8 @@ module PinterestScrapper
       end.values
     end
 
-    def manifest_file_paths
-      {
-        url_manifest_file: File.expand_path(File.join(target_folder, "url_manifest.json")),
-        pins_manifest_file: File.expand_path(File.join(target_folder, "pins_manifest.json"))
-      }
-    end
-
-    def write_manifests(url_manifest, pins_manifest)
-      url_manifest_file = File.join(target_folder, "url_manifest.json")
-      pins_manifest_file = File.join(target_folder, "pins_manifest.json")
-
-      File.write(url_manifest_file, JSON.pretty_generate(url_manifest))
-      File.write(pins_manifest_file, JSON.pretty_generate(pins_manifest))
-
-      manifest_file_paths
+    def write_state(url_manifest, pins_manifest)
+      sqlite_store.write_state(url_manifest: url_manifest, pins_manifest: pins_manifest)
     end
   end
 end

@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
-require "json"
 require "uri"
 
 require_relative "app"
+require_relative "sqlite_store"
 
 module PinterestScrapper
   class CLI
@@ -32,31 +32,30 @@ module PinterestScrapper
         target_folder, pinterest_url = parse_arguments
         result = app_factory.call(target_folder, pinterest_url).run
 
-        stdout.puts "Target folder: #{result.target_folder}"
-        stdout.puts "Pinterest URL: #{result.pinterest_url}"
-        stdout.puts "Pin URL: #{result.pin_url}"
-        stdout.puts "Pin URLs: #{result.pin_urls.length}"
-        stdout.puts "Image original URLs: #{result.image_original_urls.length}"
-        stdout.puts "Saved images: #{result.saved_image_files.length}"
-        stdout.puts "Skipped images: #{result.skipped_image_files.length}"
-        stdout.puts "Failed images: #{result.failed_image_urls.length}"
-        stdout.puts "URL manifest: #{result.url_manifest_file}"
-        stdout.puts "Pins manifest: #{result.pins_manifest_file}"
+        write_stdout "Target folder: #{result.target_folder}"
+        write_stdout "Pinterest URL: #{result.pinterest_url}"
+        write_stdout "Pin URL: #{result.pin_url}"
+        write_stdout "Pin URLs: #{result.pin_urls.length}"
+        write_stdout "Image original URLs: #{result.image_original_urls.length}"
+        write_stdout "Saved images: #{result.saved_image_files.length}"
+        write_stdout "Skipped images: #{result.skipped_image_files.length}"
+        write_stdout "Failed images: #{result.failed_image_urls.length}"
+        write_stdout "SQLite database: #{result.sqlite_database_file}"
       end
 
       SUCCESS
     rescue Interrupt
       request_stop
-      stdout.puts "Interrupt received. Ending gracefully..."
+      write_stdout "Interrupt received. Ending gracefully..."
 
       SUCCESS
     rescue ArgumentError => e
-      stderr.puts "Error: #{e.message}"
-      stderr.puts usage
+      write_stderr "Error: #{e.message}"
+      write_stderr usage
 
       ERROR
     rescue StandardError => e
-      stderr.puts "Error: #{e.message}"
+      write_stderr "Error: #{e.message}"
 
       ERROR
     end
@@ -72,8 +71,7 @@ module PinterestScrapper
       begin
         previous_handler = Signal.trap("INT") do
           request_stop
-          stdout.puts "Interrupt received. Ending gracefully after the current step..."
-          stdout.flush
+          write_stdout "Interrupt received. Ending gracefully after the current step..."
         end
         trap_installed = true
       rescue ArgumentError
@@ -94,8 +92,29 @@ module PinterestScrapper
     end
 
     def report_progress(message)
-      stdout.puts message
+      write_stdout message
+    end
+
+    def write_stdout(message)
+      stdout.puts timestamped_message(message)
       stdout.flush
+    end
+
+    def write_stderr(message)
+      stderr.puts timestamped_message(message)
+      stderr.flush
+    end
+
+    def write_prompt(message)
+      stdout.print timestamped_message(message)
+      stdout.flush
+    end
+
+    def timestamped_message(message)
+      text = message.to_s
+      return text if text.match?(/\A\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/)
+
+      "[#{Time.now.strftime("%Y-%m-%d %H:%M:%S")}] #{text}"
     end
 
     def parse_arguments
@@ -111,11 +130,8 @@ module PinterestScrapper
     end
 
     def manifest_pin_url(target_folder)
-      manifest_file = File.join(target_folder, "pins_manifest.json")
-      return nil unless File.exist?(manifest_file)
-
-      manifest = JSON.parse(File.read(manifest_file))
-      pins = Array(manifest["pins"]).select { |entry| entry.is_a?(Hash) && entry["pin_url"].to_s != "" && !entry["processed"] }
+      pins = SQLiteStore.new(target_folder: target_folder).load_pins_manifest.fetch("pins")
+      pins = pins.select { |entry| entry.is_a?(Hash) && entry["pin_url"].to_s != "" && !entry["processed"] }
       interrupted_pin = pins.find { |entry| entry["interrupted"] }
       return interrupted_pin.fetch("pin_url") if interrupted_pin
 
@@ -126,12 +142,10 @@ module PinterestScrapper
       return nil if pin_urls.empty?
 
       pin_urls.fetch(random.rand(pin_urls.length))
-    rescue JSON::ParserError
-      raise ArgumentError, "Pinterest URL missing and pins manifest is invalid: #{manifest_file}"
     end
 
     def prompt_for_pinterest_url
-      stdout.print "Pinterest URL: "
+      write_prompt "Pinterest URL: "
       stdin.gets&.strip.to_s
     end
 

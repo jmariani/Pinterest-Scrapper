@@ -2,9 +2,11 @@
 
 A small Ruby command-line app that accepts a target folder and a Pinterest URL.
 It opens the Pinterest URL in Safari, scrolls the rendered page, collects pin
-URLs and Pinterest image original URLs, saves the original images, then writes
-the results to `url_manifest.json` and `pins_manifest.json` in the target
-folder.
+URLs and Pinterest image original URLs, saves the original images, then stores
+the results in `pinterest_scrapper.sqlite3` in the target folder, where image
+rows are keyed by `image_name`.
+The SQLite database includes indexes for image insertion order, pin processing
+state, and pin update time.
 Original image URLs are collected from regular image URLs and `srcset`
 attributes.
 If multiple images resolve to the same filename, the downloader keeps the file
@@ -16,9 +18,9 @@ The Safari collector keeps scrolling until the rendered page stops exposing new
 original image URLs and pin URLs for several consecutive scrolls.
 The first Safari capture marks its tab with a unique run id, and later pin
 captures find and reuse that same marked tab for the rest of the run.
-The app processes the unprocessed pins already present in `pins_manifest.json`.
-Pins discovered during that pass are held aside, then appended to the manifest
-as unprocessed only after the current manifest queue is finished.
+The app processes the unprocessed pins already present in the SQLite database.
+Pins discovered during that pass are held aside, then added to the database as
+unprocessed only after the current database queue is finished.
 
 While it runs, the command prints progress for each scroll with the original
 image URL count, pin URL count, and current stable-scroll count.
@@ -30,7 +32,7 @@ collection, during Safari scrolling, and before downloads, then resumes after
 the machine is unlocked.
 Pressing Ctrl-C requests a graceful stop. The app finishes the current safe
 step, marks the current pin as interrupted if it has not finished, writes the
-manifests, and exits without an abort stack trace.
+database, and exits without an abort stack trace.
 
 ## Usage
 
@@ -38,14 +40,14 @@ manifests, and exits without an abort stack trace.
 ruby bin/pinterest_scrapper ./downloads https://www.pinterest.com/pin/123456789/
 ```
 
-To resume from `pins_manifest.json`, omit the URL. The app first retries an
+To resume from the SQLite database, omit the URL. The app first retries an
 interrupted pin if one exists; otherwise it chooses a random unprocessed pin:
 
 ```sh
 ruby bin/pinterest_scrapper ./downloads
 ```
 
-If no manifest exists, or every pin in the manifest is already processed, the
+If no database exists, or every pin in the database is already processed, the
 app prompts for a Pinterest URL.
 
 The app validates that:
