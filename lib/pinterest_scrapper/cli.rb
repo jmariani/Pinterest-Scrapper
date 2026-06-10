@@ -35,8 +35,8 @@ module PinterestScrapper
         write_stdout "Target folder: #{result.target_folder}"
         write_stdout "Pinterest URL: #{result.pinterest_url}"
         write_stdout "Pin URL: #{result.pin_url}"
-        write_stdout "Pin URLs: #{result.pin_urls.length}"
-        write_stdout "Image original URLs: #{result.image_original_urls.length}"
+        write_stdout "Pin URLs: #{result_count(result, :pin_url_count, :pin_urls)}"
+        write_stdout "Image original URLs: #{result_count(result, :image_original_url_count, :image_original_urls)}"
         write_stdout "Saved images: #{result.saved_image_files.length}"
         write_stdout "Skipped images: #{result.skipped_image_files.length}"
         write_stdout "Failed images: #{result.failed_image_urls.length}"
@@ -63,6 +63,14 @@ module PinterestScrapper
     private
 
     attr_reader :argv, :stdout, :stderr, :stdin, :app_factory, :random
+
+    def result_count(result, count_method, collection_method)
+      if result.respond_to?(count_method) && !result.public_send(count_method).nil?
+        result.public_send(count_method)
+      else
+        result.public_send(collection_method).length
+      end
+    end
 
     def with_interrupt_handler
       previous_handler = nil
@@ -123,25 +131,21 @@ module PinterestScrapper
       end
 
       target_folder = argv[0]
-      raw_pinterest_url = argv[1] || manifest_pin_url(target_folder) || prompt_for_pinterest_url
+      raw_pinterest_url = argv[1] || database_pin_url(target_folder) || prompt_for_pinterest_url
       pinterest_url = parse_pinterest_url(raw_pinterest_url)
 
       [target_folder, pinterest_url]
     end
 
-    def manifest_pin_url(target_folder)
-      pins = SQLiteStore.new(target_folder: target_folder).load_pins_manifest.fetch("pins")
-      pins = pins.select { |entry| entry.is_a?(Hash) && entry["pin_url"].to_s != "" && !entry["processed"] }
-      interrupted_pin = pins.find { |entry| entry["interrupted"] }
-      return interrupted_pin.fetch("pin_url") if interrupted_pin
+    def database_pin_url(target_folder)
+      store = SQLiteStore.new(target_folder: target_folder)
+      interrupted_pin_url = store.next_interrupted_pin_url
+      return interrupted_pin_url if interrupted_pin_url
 
-      pin_urls = pins.map do |entry|
-        entry.fetch("pin_url")
-      end
-
-      return nil if pin_urls.empty?
-
-      pin_urls.fetch(random.rand(pin_urls.length))
+      cursor = store.random_unprocessed_pin_cursor
+      cursor.next_pin_url
+    ensure
+      cursor&.close
     end
 
     def prompt_for_pinterest_url

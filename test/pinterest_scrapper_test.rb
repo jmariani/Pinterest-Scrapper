@@ -12,8 +12,10 @@ class PinterestScrapperTest < Minitest::Test
     :pinterest_url,
     :pin_url,
     :pin_urls,
+    :pin_url_count,
     :urls,
     :image_original_urls,
+    :image_original_url_count,
     :saved_image_files,
     :skipped_image_files,
     :failed_image_urls,
@@ -30,6 +32,120 @@ class PinterestScrapperTest < Minitest::Test
   FixedRandom = Struct.new(:value) do
     def rand(_limit)
       value
+    end
+  end
+
+  FakePinCursor = Struct.new(:pin_urls) do
+    attr_reader :closed
+
+    def next_pin_url
+      pin_urls.shift
+    end
+
+    def close
+      @closed = true
+    end
+
+    def closed?
+      !!closed
+    end
+  end
+
+  FakeSQLiteStore = Struct.new(
+    :image_urls,
+    :pins,
+    :written_image_url_batches,
+    :written_pin_batches,
+    keyword_init: true
+  ) do
+    def setup; end
+
+    def database_file
+      "/tmp/fake-pinterest-scrapper.sqlite3"
+    end
+
+    def load_image_urls
+      image_urls
+    end
+
+    def image_url_count
+      image_urls.length
+    end
+
+    def load_pins
+      pins
+    end
+
+    def pin_count
+      pins.length
+    end
+
+    def write_image_urls(urls)
+      written_image_url_batches << urls
+      inserted_urls = urls.reject { |url| image_urls.include?(url) }
+      image_urls.concat(inserted_urls)
+      inserted_urls
+    end
+
+    def write_pins(pins)
+      written_pin_batches << pins
+      inserted_count = 0
+      pins.each do |pin|
+        next if self.pins.any? { |existing_pin| existing_pin.fetch("pin_url") == pin.fetch("pin_url") }
+
+        self.pins << {
+          "pin_url" => pin.fetch("pin_url"),
+          "processed" => !!pin["processed"],
+          "interrupted" => !!pin["interrupted"]
+        }
+        inserted_count += 1
+      end
+      inserted_count
+    end
+
+    def write_interrupted_pins(pins)
+      raise "pin cursor is still open" if @last_cursor && !@last_cursor.closed?
+
+      written_pin_batches << pins
+      pins.each do |pin|
+        upsert_pin(pin.fetch("pin_url"), processed: false, interrupted: true)
+      end
+    end
+
+    def write_processed_pins(pins)
+      written_pin_batches << pins
+      pins.each do |pin|
+        upsert_pin(pin.fetch("pin_url"), processed: true, interrupted: false)
+      end
+    end
+
+    def next_unprocessed_pin_url
+      pin = pins.find { |entry| !entry["processed"] && entry["interrupted"] } ||
+            pins.find { |entry| !entry["processed"] }
+      pin&.fetch("pin_url")
+    end
+
+    def next_interrupted_pin_url
+      pin = pins.find { |entry| !entry["processed"] && entry["interrupted"] }
+      pin&.fetch("pin_url")
+    end
+
+    def random_unprocessed_pin_cursor
+      @last_cursor = FakePinCursor.new(
+        pins.reject { |entry| entry["processed"] || entry["interrupted"] }.map { |entry| entry.fetch("pin_url") }
+      )
+    end
+
+    private
+
+    def upsert_pin(pin_url, processed:, interrupted:)
+      pin = pins.find { |entry| entry.fetch("pin_url") == pin_url }
+      unless pin
+        pin = { "pin_url" => pin_url }
+        pins << pin
+      end
+      pin["processed"] = processed
+      pin["interrupted"] = interrupted
     end
   end
 
@@ -108,31 +224,50 @@ class PinterestScrapperTest < Minitest::Test
   def test_cli_uses_random_unprocessed_pin_when_second_parameter_is_missing
     Dir.mktmpdir do |dir|
       target_folder = File.join(dir, "downloads")
-      PinterestScrapper::SQLiteStore.new(target_folder: target_folder).write_state(
-        url_manifest: { "urls" => [], "image_original_urls" => [] },
-        pins_manifest: {
-          "pins" => [
-            { "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => true },
-            { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false },
-            { "pin_url" => "https://www.pinterest.com/pin/333333333/", "processed" => false }
-          ]
-        }
+      PinterestScrapper::SQLiteStore.new(target_folder: target_folder).write_pins(
+        [
+          { "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => true },
+          { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false },
+          { "pin_url" => "https://www.pinterest.com/pin/333333333/", "processed" => false }
+        ]
       )
       stdout = StringIO.new
       stderr = StringIO.new
-      app_factory = fake_app_factory(target_folder, "https://www.pinterest.com/pin/333333333/")
+      selected_urls = []
+      app_factory = lambda do |_target_folder, pinterest_url|
+        selected_urls << pinterest_url.to_s
+        FakeApp.new(
+          result: FakeResult.new(
+            target_folder: target_folder,
+            pinterest_url: pinterest_url.to_s,
+            pin_url: pinterest_url.to_s,
+            pin_urls: [pinterest_url.to_s],
+            pin_url_count: 1,
+            urls: [pinterest_url.to_s],
+            image_original_urls: [],
+            image_original_url_count: 0,
+            saved_image_files: [],
+            skipped_image_files: [],
+            failed_image_urls: [],
+            sqlite_database_file: File.join(target_folder, "pinterest_scrapper.sqlite3")
+          )
+        )
+      end
 
       status = PinterestScrapper::CLI.new(
         [target_folder],
         stdout: stdout,
         stderr: stderr,
-        app_factory: app_factory,
-        random: FixedRandom.new(1)
+        app_factory: app_factory
       ).call
 
       assert_equal 0, status
       assert_includes stdout.string, "Target folder: #{target_folder}"
-      assert_includes stdout.string, "Pinterest URL: https://www.pinterest.com/pin/333333333/"
+      assert_includes [
+        "https://www.pinterest.com/pin/222222222/",
+        "https://www.pinterest.com/pin/333333333/"
+      ], selected_urls.fetch(0)
+      assert_includes stdout.string, "Pinterest URL: #{selected_urls.fetch(0)}"
       assert_empty stderr.string
     end
   end
@@ -140,15 +275,12 @@ class PinterestScrapperTest < Minitest::Test
   def test_cli_uses_interrupted_pin_before_random_unprocessed_pin_when_second_parameter_is_missing
     Dir.mktmpdir do |dir|
       target_folder = File.join(dir, "downloads")
-      PinterestScrapper::SQLiteStore.new(target_folder: target_folder).write_state(
-        url_manifest: { "urls" => [], "image_original_urls" => [] },
-        pins_manifest: {
-          "pins" => [
-            { "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => false },
-            { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false, "interrupted" => true },
-            { "pin_url" => "https://www.pinterest.com/pin/333333333/", "processed" => false }
-          ]
-        }
+      PinterestScrapper::SQLiteStore.new(target_folder: target_folder).write_pins(
+        [
+          { "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => false },
+          { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false, "interrupted" => true },
+          { "pin_url" => "https://www.pinterest.com/pin/333333333/", "processed" => false }
+        ]
       )
       stdout = StringIO.new
       stderr = StringIO.new
@@ -171,11 +303,8 @@ class PinterestScrapperTest < Minitest::Test
   def test_cli_prompts_when_second_parameter_is_missing_and_no_unprocessed_pin_exists
     Dir.mktmpdir do |dir|
       target_folder = File.join(dir, "downloads")
-      PinterestScrapper::SQLiteStore.new(target_folder: target_folder).write_state(
-        url_manifest: { "urls" => [], "image_original_urls" => [] },
-        pins_manifest: {
-          "pins" => [{ "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => true }]
-        }
+      PinterestScrapper::SQLiteStore.new(target_folder: target_folder).write_pins(
+        [{ "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => true }]
       )
       stdout = StringIO.new
       stderr = StringIO.new
@@ -225,14 +354,11 @@ class PinterestScrapperTest < Minitest::Test
     Dir.mktmpdir do |dir|
       target_folder = File.join(dir, "downloads")
       store = PinterestScrapper::SQLiteStore.new(target_folder: target_folder)
-      store.write_state(
-        url_manifest: { "urls" => [], "image_original_urls" => [] },
-        pins_manifest: {
-          "pins" => [
-            { "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => false, "interrupted" => false },
-            { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false, "interrupted" => true }
-          ]
-        }
+      store.write_pins(
+        [
+          { "pin_url" => "https://www.pinterest.com/pin/111111111/", "processed" => false, "interrupted" => false },
+          { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false, "interrupted" => true }
+        ]
       )
       stdout = StringIO.new
       stderr = StringIO.new
@@ -287,16 +413,11 @@ class PinterestScrapperTest < Minitest::Test
   def test_sqlite_store_defaults_created_at_to_current_timestamp
     Dir.mktmpdir do |dir|
       store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
-      store.write_state(
-        url_manifest: {
-          "urls" => ["https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg"],
-          "image_original_urls" => ["https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg"]
-        },
-        pins_manifest: {
-          "pins" => [
-            { "pin_url" => "https://www.pinterest.com/pin/123456789/", "processed" => false, "interrupted" => false }
-          ]
-        }
+      store.write_image_urls(["https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg"])
+      store.write_pins(
+        [
+          { "pin_url" => "https://www.pinterest.com/pin/123456789/", "processed" => false, "interrupted" => false }
+        ]
       )
       database = SQLite3::Database.new(store.database_file)
       database.results_as_hash = true
@@ -323,26 +444,97 @@ class PinterestScrapperTest < Minitest::Test
       replacement_image_url = "https://i.pinimg.com/originals/12/34/56/photo.jpg"
       pin_url = "https://www.pinterest.com/pin/123456789/"
 
-      store.write_state(
-        url_manifest: {
-          "urls" => [image_url, replacement_image_url],
-          "image_original_urls" => [image_url, replacement_image_url]
-        },
-        pins_manifest: {
-          "pins" => [
-            { "pin_url" => pin_url, "processed" => false, "interrupted" => true },
-            { "pin_url" => pin_url, "processed" => true, "interrupted" => false }
-          ]
-        }
+      store.write_image_urls([image_url, replacement_image_url])
+      store.write_pins(
+        [
+          { "pin_url" => pin_url, "processed" => false, "interrupted" => true },
+          { "pin_url" => pin_url, "processed" => true, "interrupted" => false }
+        ]
       )
 
       database = SQLite3::Database.new(store.database_file)
 
       assert_equal 1, database.get_first_value("SELECT COUNT(*) FROM image_urls WHERE image_name = ?", ["photo.jpg"])
-      assert_equal replacement_image_url, database.get_first_value("SELECT url FROM image_urls WHERE image_name = ?", ["photo.jpg"])
+      assert_equal image_url, database.get_first_value("SELECT url FROM image_urls WHERE image_name = ?", ["photo.jpg"])
       assert_equal 1, database.get_first_value("SELECT COUNT(*) FROM pins WHERE pin_url = ?", [pin_url])
-      assert_equal 1, database.get_first_value("SELECT processed FROM pins WHERE pin_url = ?", [pin_url])
-      assert_equal 0, database.get_first_value("SELECT interrupted FROM pins WHERE pin_url = ?", [pin_url])
+      assert_equal 0, database.get_first_value("SELECT processed FROM pins WHERE pin_url = ?", [pin_url])
+      assert_equal 1, database.get_first_value("SELECT interrupted FROM pins WHERE pin_url = ?", [pin_url])
+    ensure
+      database&.close
+    end
+  end
+
+  def test_sqlite_store_updates_interrupted_pins_before_inserting_missing_ones
+    Dir.mktmpdir do |dir|
+      store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
+      existing_pin_url = "https://www.pinterest.com/pin/123456789/"
+      missing_pin_url = "https://www.pinterest.com/pin/987654321/"
+      store.write_pins(
+        [
+          { "pin_url" => existing_pin_url, "processed" => true, "interrupted" => false }
+        ]
+      )
+
+      store.write_interrupted_pins(
+        [
+          { "pin_url" => existing_pin_url, "processed" => false, "interrupted" => true },
+          { "pin_url" => missing_pin_url, "processed" => false, "interrupted" => true }
+        ]
+      )
+
+      database = SQLite3::Database.new(store.database_file)
+
+      assert_equal 2, database.get_first_value("SELECT COUNT(*) FROM pins")
+      assert_equal 0, database.get_first_value("SELECT processed FROM pins WHERE pin_url = ?", [existing_pin_url])
+      assert_equal 1, database.get_first_value("SELECT interrupted FROM pins WHERE pin_url = ?", [existing_pin_url])
+      assert_equal 0, database.get_first_value("SELECT processed FROM pins WHERE pin_url = ?", [missing_pin_url])
+      assert_equal 1, database.get_first_value("SELECT interrupted FROM pins WHERE pin_url = ?", [missing_pin_url])
+    ensure
+      database&.close
+    end
+  end
+
+  def test_sqlite_store_write_pins_returns_inserted_count
+    Dir.mktmpdir do |dir|
+      store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
+      pin_url = "https://www.pinterest.com/pin/123456789/"
+
+      inserted_count = store.write_pins(
+        [
+          { "pin_url" => pin_url, "processed" => false, "interrupted" => false },
+          { "pin_url" => pin_url, "processed" => false, "interrupted" => false }
+        ]
+      )
+
+      assert_equal 1, inserted_count
+    end
+  end
+
+  def test_sqlite_store_updates_processed_pins_before_inserting_missing_ones
+    Dir.mktmpdir do |dir|
+      store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
+      existing_pin_url = "https://www.pinterest.com/pin/123456789/"
+      missing_pin_url = "https://www.pinterest.com/pin/987654321/"
+      store.write_pins(
+        [
+          { "pin_url" => existing_pin_url, "processed" => false, "interrupted" => true }
+        ]
+      )
+
+      store.write_processed_pins(
+        [
+          { "pin_url" => existing_pin_url, "processed" => true, "interrupted" => false },
+          { "pin_url" => missing_pin_url, "processed" => true, "interrupted" => false }
+        ]
+      )
+
+      database = SQLite3::Database.new(store.database_file)
+
+      assert_equal 2, database.get_first_value("SELECT COUNT(*) FROM pins")
+      assert_equal 1, database.get_first_value("SELECT processed FROM pins WHERE pin_url = ?", [existing_pin_url])
+      assert_equal 0, database.get_first_value("SELECT interrupted FROM pins WHERE pin_url = ?", [existing_pin_url])
+      assert_equal 1, database.get_first_value("SELECT processed FROM pins WHERE pin_url = ?", [missing_pin_url])
+      assert_equal 0, database.get_first_value("SELECT interrupted FROM pins WHERE pin_url = ?", [missing_pin_url])
     ensure
       database&.close
     end
@@ -467,16 +659,18 @@ class PinterestScrapperTest < Minitest::Test
       assert_includes progress_messages, "Opening Safari and collecting rendered page URLs: https://www.pinterest.com/pin/123456789/"
       assert_includes progress_messages, "scroll 1: 1 original image URLs, 1 pin URLs, stable 0/3"
       assert_includes progress_messages, "Collected 9 original image URLs and 4 pin URLs."
-      assert_includes progress_messages, "3 new pin URLs queued for future runs."
-      assert_includes progress_messages, "9 new original image URLs. 0 already in database."
+      assert_includes progress_messages, "4 total pin URLs. 4 inserted. 0 duplicated."
+      assert_includes progress_messages, "9 original image URLs ready for database insert."
+      assert_includes progress_messages, "9 total image URLs. 9 inserted. 0 duplicated."
       assert_includes progress_messages, "Downloading 9 original images..."
+      assert_operator progress_messages.index("Downloading 9 original images..."), :>, progress_messages.index("9 total image URLs. 9 inserted. 0 duplicated.")
+      assert_operator progress_messages.index("4 total pin URLs. 4 inserted. 0 duplicated."), :>, progress_messages.index("Saved 9 images. Skipped 0. Failed 0.")
       refute_includes progress_messages, "Downloading image 1/9: 00c5caec39417c90e888c676a7ea8df5.jpg"
       assert_includes progress_messages, "Saved image 9/9: ddeeff.jpg"
       assert_includes progress_messages, "Saved 9 images. Skipped 0. Failed 0."
-      assert_includes progress_messages, "Added 3 new pins to database for future runs."
-      refute_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/555555555/"
-      refute_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/777777777/"
-      refute_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/987654321/"
+      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/555555555/"
+      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/777777777/"
+      assert_includes progress_messages, "Processing next pin: https://www.pinterest.com/pin/987654321/"
       assert_equal "https://www.pinterest.com/pin/123456789/", result.pin_url
       assert_equal [
         "https://www.pinterest.com/pin/123456789/",
@@ -484,6 +678,7 @@ class PinterestScrapperTest < Minitest::Test
         "https://www.pinterest.com/pin/777777777/",
         "https://www.pinterest.com/pin/987654321/"
       ], result.pin_urls
+      assert_equal 4, result.pin_url_count
       assert_equal [
         "https://i.pinimg.com/originals/00/c5/ca/00c5caec39417c90e888c676a7ea8df5.jpg",
         "https://i.pinimg.com/originals/11/22/33/112233.jpg",
@@ -495,6 +690,7 @@ class PinterestScrapperTest < Minitest::Test
         "https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg",
         "https://i.pinimg.com/originals/dd/ee/ff/ddeeff.jpg"
       ], result.image_original_urls
+      assert_equal 9, result.image_original_url_count
       assert_equal result.image_original_urls, downloaded_urls
       assert_equal saved_image_files, result.saved_image_files
       assert_empty result.skipped_image_files
@@ -511,16 +707,17 @@ class PinterestScrapperTest < Minitest::Test
       assert_includes result.urls, "https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg"
       assert File.exist?(result.sqlite_database_file)
       refute File.exist?(File.join(dir, "url_manifest.json"))
-      refute File.exist?(File.join(dir, "pins_manifest.json"))
-      pins_manifest = PinterestScrapper::SQLiteStore.new(target_folder: dir).load_pins_manifest
-      processed_pins = pins_manifest.fetch("pins").select { |pin| pin.fetch("processed") }
-      unprocessed_pins = pins_manifest.fetch("pins").reject { |pin| pin.fetch("processed") }
-      assert_equal ["https://www.pinterest.com/pin/123456789/"], processed_pins.map { |pin| pin.fetch("pin_url") }
+      refute File.exist?(File.join(dir, "pins.json"))
+      pins = PinterestScrapper::SQLiteStore.new(target_folder: dir).load_pins
+      processed_pins = pins.select { |pin| pin.fetch("processed") }
+      unprocessed_pins = pins.reject { |pin| pin.fetch("processed") }
       assert_equal [
+        "https://www.pinterest.com/pin/123456789/",
         "https://www.pinterest.com/pin/555555555/",
         "https://www.pinterest.com/pin/777777777/",
         "https://www.pinterest.com/pin/987654321/"
-      ], unprocessed_pins.map { |pin| pin.fetch("pin_url") }
+      ], processed_pins.map { |pin| pin.fetch("pin_url") }
+      assert_empty unprocessed_pins
       database = SQLite3::Database.new(result.sqlite_database_file)
       assert_equal 9, database.get_first_value("SELECT COUNT(*) FROM image_urls")
       assert_equal 4, database.get_first_value("SELECT COUNT(*) FROM pins")
@@ -620,12 +817,213 @@ class PinterestScrapperTest < Minitest::Test
         stop_requested: -> { stop_state[:requested] }
       ).run
 
-      pins_manifest = PinterestScrapper::SQLiteStore.new(target_folder: dir).load_pins_manifest
+      pins = PinterestScrapper::SQLiteStore.new(target_folder: dir).load_pins
 
       assert_includes progress_messages, "Stop requested. Marking current pin as interrupted."
       assert_equal [
         { "pin_url" => "https://www.pinterest.com/pin/123456789/", "processed" => false, "interrupted" => true }
-      ], pins_manifest.fetch("pins")
+      ], pins
+    end
+  end
+
+  def test_app_skips_collected_pin_insert_when_stop_is_requested_during_downloads
+    Dir.mktmpdir do |dir|
+      page_fetcher = Struct.new(:body) do
+        def fetch(url)
+          PinterestScrapper::PageFetcher::Page.new(url: url.to_s, body: body)
+        end
+      end.new("<html></html>")
+      safari_snapshot = Struct.new(:body) do
+        def capture(url, progress: nil)
+          PinterestScrapper::SafariSnapshot::Snapshot.new(url: url.to_s, body: body, urls: [])
+        end
+      end.new(<<~HTML)
+        <link rel="canonical" href="https://www.pinterest.com/pin/123456789/">
+        <a href="https://www.pinterest.com/pin/987654321/">Related</a>
+        <img src="https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg">
+      HTML
+      stop_state = { requested: false }
+      image_downloader = Struct.new(:stop_state) do
+        def download_all(_urls, _target_folder, progress: nil, stop_requested: nil)
+          stop_state[:requested] = true
+          PinterestScrapper::ImageDownloader::Result.new(saved_files: [], skipped_files: [], failed_urls: [])
+        end
+      end.new(stop_state)
+      store = FakeSQLiteStore.new(
+        image_urls: [],
+        pins: [],
+        written_image_url_batches: [],
+        written_pin_batches: []
+      )
+
+      PinterestScrapper::App.new(
+        target_folder: dir,
+        pinterest_url: URI.parse("https://www.pinterest.com/pin/123456789/"),
+        page_fetcher: page_fetcher,
+        safari_snapshot: safari_snapshot,
+        image_downloader: image_downloader,
+        sqlite_store: store,
+        stop_requested: -> { stop_state[:requested] }
+      ).run
+
+      assert_equal [
+        [{ "pin_url" => "https://www.pinterest.com/pin/123456789/", "processed" => false, "interrupted" => true }]
+      ], store.written_pin_batches
+      assert_equal [
+        { "pin_url" => "https://www.pinterest.com/pin/123456789/", "processed" => false, "interrupted" => true }
+      ], store.pins
+    end
+  end
+
+  def test_app_uses_counts_without_loading_full_tables_after_stop
+    Dir.mktmpdir do |dir|
+      page_fetcher = Struct.new(:body) do
+        def fetch(url)
+          PinterestScrapper::PageFetcher::Page.new(url: url.to_s, body: body)
+        end
+      end.new("<html></html>")
+      safari_snapshot = Struct.new(:body) do
+        def capture(url, progress: nil)
+          PinterestScrapper::SafariSnapshot::Snapshot.new(url: url.to_s, body: body, urls: [])
+        end
+      end.new(<<~HTML)
+        <link rel="canonical" href="https://www.pinterest.com/pin/123456789/">
+        <img src="https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg">
+      HTML
+      stop_state = { requested: false }
+      image_downloader = Struct.new(:stop_state) do
+        def download_all(_urls, _target_folder, progress: nil, stop_requested: nil)
+          stop_state[:requested] = true
+          PinterestScrapper::ImageDownloader::Result.new(saved_files: [], skipped_files: [], failed_urls: [])
+        end
+      end.new(stop_state)
+      store = FakeSQLiteStore.new(
+        image_urls: [],
+        pins: [],
+        written_image_url_batches: [],
+        written_pin_batches: []
+      )
+      def store.load_image_urls
+        raise "loaded image URLs"
+      end
+      def store.load_pins
+        raise "loaded pins"
+      end
+
+      result = PinterestScrapper::App.new(
+        target_folder: dir,
+        pinterest_url: URI.parse("https://www.pinterest.com/pin/123456789/"),
+        page_fetcher: page_fetcher,
+        safari_snapshot: safari_snapshot,
+        image_downloader: image_downloader,
+        sqlite_store: store,
+        stop_requested: -> { stop_state[:requested] }
+      ).run
+
+      assert_equal 1, result.image_original_url_count
+      assert_equal 1, result.pin_url_count
+      assert_empty result.image_original_urls
+      assert_empty result.pin_urls
+    end
+  end
+
+  def test_app_closes_random_pin_cursor_before_marking_pin_interrupted
+    Dir.mktmpdir do |dir|
+      page_fetcher = Struct.new(:body) do
+        def fetch(url)
+          PinterestScrapper::PageFetcher::Page.new(url: url.to_s, body: body)
+        end
+      end.new("<html></html>")
+      safari_snapshot = Struct.new(:bodies) do
+        def capture(url, progress: nil)
+          PinterestScrapper::SafariSnapshot::Snapshot.new(url: url.to_s, body: bodies.fetch(url.to_s), urls: [])
+        end
+      end.new({
+        "https://www.pinterest.com/pin/111111111/" => <<~HTML,
+          <link rel="canonical" href="https://www.pinterest.com/pin/111111111/">
+          <a href="https://www.pinterest.com/pin/222222222/">Next</a>
+          <img src="https://i.pinimg.com/originals/11/11/11/111111.jpg">
+        HTML
+        "https://www.pinterest.com/pin/222222222/" => <<~HTML
+          <link rel="canonical" href="https://www.pinterest.com/pin/222222222/">
+          <img src="https://i.pinimg.com/originals/22/22/22/222222.jpg">
+        HTML
+      })
+      stop_state = { calls: 0 }
+      image_downloader = Struct.new(:stop_state) do
+        def download_all(_urls, _target_folder, progress: nil, stop_requested: nil)
+          stop_state[:calls] += 1
+          stop_state[:requested] = true if stop_state[:calls] == 2
+          PinterestScrapper::ImageDownloader::Result.new(saved_files: [], skipped_files: [], failed_urls: [])
+        end
+      end.new(stop_state)
+      store = FakeSQLiteStore.new(
+        image_urls: [],
+        pins: [],
+        written_image_url_batches: [],
+        written_pin_batches: []
+      )
+
+      PinterestScrapper::App.new(
+        target_folder: dir,
+        pinterest_url: URI.parse("https://www.pinterest.com/pin/111111111/"),
+        page_fetcher: page_fetcher,
+        safari_snapshot: safari_snapshot,
+        image_downloader: image_downloader,
+        sqlite_store: store,
+        stop_requested: -> { stop_state[:requested] }
+      ).run
+
+      assert_equal [
+        { "pin_url" => "https://www.pinterest.com/pin/222222222/", "processed" => false, "interrupted" => true }
+      ], store.pins.select { |pin| pin.fetch("pin_url") == "https://www.pinterest.com/pin/222222222/" }
+    end
+  end
+
+  def test_app_downloads_only_image_urls_inserted_into_database
+    Dir.mktmpdir do |dir|
+      page_fetcher = Struct.new(:body) do
+        def fetch(url)
+          PinterestScrapper::PageFetcher::Page.new(url: url.to_s, body: body)
+        end
+      end.new("<html></html>")
+      safari_snapshot = Struct.new(:body) do
+        def capture(url, progress: nil)
+          PinterestScrapper::SafariSnapshot::Snapshot.new(url: url.to_s, body: body, urls: [])
+        end
+      end.new(<<~HTML)
+        <link rel="canonical" href="https://www.pinterest.com/pin/123456789/">
+        <img src="https://i.pinimg.com/originals/ab/cd/ef/existing.jpg">
+        <img src="https://i.pinimg.com/originals/ab/cd/ef/new.jpg">
+      HTML
+      image_downloader = Struct.new(:downloaded_urls) do
+        def download_all(urls, _target_folder, progress: nil, stop_requested: nil)
+          downloaded_urls.concat(urls)
+          PinterestScrapper::ImageDownloader::Result.new(saved_files: [], skipped_files: [], failed_urls: [])
+        end
+      end.new([])
+      store = FakeSQLiteStore.new(
+        image_urls: ["https://i.pinimg.com/originals/ab/cd/ef/existing.jpg"],
+        pins: [],
+        written_image_url_batches: [],
+        written_pin_batches: []
+      )
+
+      PinterestScrapper::App.new(
+        target_folder: dir,
+        pinterest_url: URI.parse("https://www.pinterest.com/pin/123456789/"),
+        page_fetcher: page_fetcher,
+        safari_snapshot: safari_snapshot,
+        image_downloader: image_downloader,
+        sqlite_store: store
+      ).run
+
+      expected_urls = [
+        "https://i.pinimg.com/originals/ab/cd/ef/existing.jpg",
+        "https://i.pinimg.com/originals/ab/cd/ef/new.jpg"
+      ]
+      assert_equal [expected_urls], store.written_image_url_batches
+      assert_equal ["https://i.pinimg.com/originals/ab/cd/ef/new.jpg"], image_downloader.downloaded_urls
     end
   end
 
@@ -816,8 +1214,10 @@ class PinterestScrapperTest < Minitest::Test
           pinterest_url: pinterest_url,
           pin_url: pinterest_url,
           pin_urls: [pinterest_url],
+          pin_url_count: 1,
           urls: [pinterest_url],
           image_original_urls: ["https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg"],
+          image_original_url_count: 1,
           saved_image_files: [File.join(target_folder, "abcdef.jpg")],
           skipped_image_files: [],
           failed_image_urls: [],

@@ -18,8 +18,10 @@ module PinterestScrapper
       :pinterest_url,
       :pin_url,
       :pin_urls,
+      :pin_url_count,
       :urls,
       :image_original_urls,
+      :image_original_url_count,
       :saved_image_files,
       :skipped_image_files,
       :failed_image_urls,
@@ -54,84 +56,88 @@ module PinterestScrapper
     end
 
     def run
-      FileUtils.mkdir_p(target_folder)
-      sqlite_store.setup
-      url_manifest = load_url_manifest
-      pins_manifest = load_pins_manifest
-      saved_image_files = []
-      skipped_image_files = []
-      failed_image_urls = []
-      last_scraped_page = nil
-      next_url = pinterest_url.to_s
-      pending_pin_urls = []
-      add_seed_pin(pins_manifest, next_url)
+      begin
+        FileUtils.mkdir_p(target_folder)
+        sqlite_store.setup
+        saved_image_files = []
+        skipped_image_files = []
+        failed_image_urls = []
+        last_scraped_page = nil
+        next_url = pinterest_url.to_s
+        stopped_early = false
 
-      loop do
-        if stop_requested?
-          report_progress "Stop requested. Writing database and ending gracefully."
-          write_state(url_manifest, pins_manifest)
-          break
+        loop do
+          if stop_requested?
+            report_progress "Stop requested. Ending gracefully."
+            stopped_early = true
+            break
+          end
+
+          wait_until_unlocked
+          last_scraped_page = scrape_page(next_url)
+          collected_pin_urls = last_scraped_page.pin_urls
+          collected_image_urls = last_scraped_page.image_original_urls
+          report_progress "#{collected_image_urls.length} original image URLs ready for database insert."
+          close_pin_cursor
+          inserted_image_urls = write_image_urls(collected_image_urls)
+          duplicated_image_url_count = collected_image_urls.length - inserted_image_urls.length
+          report_progress "#{collected_image_urls.length} total image URLs. #{inserted_image_urls.length} inserted. #{duplicated_image_url_count} duplicated."
+
+          wait_until_unlocked
+          download_result = download_images(inserted_image_urls)
+          saved_image_files.concat(download_result.saved_files)
+          skipped_image_files.concat(download_result.skipped_files)
+          failed_image_urls.concat(download_result.failed_urls)
+
+          if stop_requested?
+            report_progress "Stop requested. Marking current pin as interrupted."
+            close_pin_cursor
+            write_interrupted_pins(status_pin_records([next_url, last_scraped_page.pin_url], interrupted: true))
+            stopped_early = true
+            break
+          end
+
+          inserted_pin_count = write_pins(pin_records(collected_pin_urls))
+          duplicated_pin_count = collected_pin_urls.length - inserted_pin_count
+          report_progress "#{collected_pin_urls.length} total pin URLs. #{inserted_pin_count} inserted. #{duplicated_pin_count} duplicated."
+
+          write_processed_pins(status_pin_records([next_url, last_scraped_page.pin_url], processed: true))
+
+          if stop_requested?
+            report_progress "Stop requested. Ending gracefully before the next pin."
+            stopped_early = true
+            break
+          end
+
+          next_pin_url = next_unprocessed_pin_url
+          break unless next_pin_url
+
+          next_url = next_pin_url
+          report_progress "Processing next pin: #{next_url}"
         end
 
-        wait_until_unlocked
-        last_scraped_page = scrape_page(next_url)
-        newly_discovered_pin_urls = new_pin_urls(pins_manifest, pending_pin_urls, last_scraped_page.pin_urls)
-        pending_pin_urls.concat(newly_discovered_pin_urls)
-        report_progress "#{newly_discovered_pin_urls.length} new pin URLs queued for future runs." if newly_discovered_pin_urls.any?
-        new_image_urls = add_image_urls(url_manifest, last_scraped_page.image_original_urls)
-        already_known_image_count = last_scraped_page.image_original_urls.length - new_image_urls.length
-        report_progress "#{new_image_urls.length} new original image URLs. #{already_known_image_count} already in database."
-        write_state(url_manifest, pins_manifest)
+        image_original_urls = stopped_early ? [] : sqlite_store.load_image_urls
+        pin_urls = stopped_early ? [] : load_pin_urls
+        image_original_url_count = stopped_early ? sqlite_store.image_url_count : image_original_urls.length
+        pin_url_count = stopped_early ? sqlite_store.pin_count : pin_urls.length
 
-        wait_until_unlocked
-        download_result = download_images(new_image_urls)
-        saved_image_files.concat(download_result.saved_files)
-        skipped_image_files.concat(download_result.skipped_files)
-        failed_image_urls.concat(download_result.failed_urls)
-
-        if stop_requested?
-          mark_pin_interrupted(pins_manifest, next_url)
-          mark_pin_interrupted(pins_manifest, last_scraped_page.pin_url)
-          report_progress "Stop requested. Marking current pin as interrupted."
-          write_state(url_manifest, pins_manifest)
-          break
-        end
-
-        mark_pin_processed(pins_manifest, next_url)
-        mark_pin_processed(pins_manifest, last_scraped_page.pin_url)
-        write_state(url_manifest, pins_manifest)
-
-        if stop_requested?
-          report_progress "Stop requested. Ending gracefully before the next pin."
-          break
-        end
-
-        next_pin = next_unprocessed_pin(pins_manifest)
-        break unless next_pin
-
-        next_url = next_pin.fetch("pin_url")
-        report_progress "Processing next pin: #{next_url}"
+        Result.new(
+          target_folder: File.expand_path(target_folder),
+          pinterest_url: pinterest_url.to_s,
+          pin_url: pinterest_url.to_s,
+          pin_urls: pin_urls,
+          pin_url_count: pin_url_count,
+          urls: image_original_urls,
+          image_original_urls: image_original_urls,
+          image_original_url_count: image_original_url_count,
+          saved_image_files: saved_image_files.uniq,
+          skipped_image_files: skipped_image_files.uniq,
+          failed_image_urls: failed_image_urls,
+          sqlite_database_file: sqlite_store.database_file
+        )
+      ensure
+        close_pin_cursor
       end
-
-      add_pins(pins_manifest, pending_pin_urls)
-      report_progress "Added #{pending_pin_urls.length} new pins to database for future runs." if pending_pin_urls.any?
-      write_state(url_manifest, pins_manifest)
-
-      image_original_urls = url_manifest.fetch("image_original_urls")
-      pin_urls = pins_manifest.fetch("pins").map { |pin| pin.fetch("pin_url") }
-
-      Result.new(
-        target_folder: File.expand_path(target_folder),
-        pinterest_url: pinterest_url.to_s,
-        pin_url: pinterest_url.to_s,
-        pin_urls: pin_urls,
-        urls: image_original_urls,
-        image_original_urls: image_original_urls,
-        saved_image_files: saved_image_files.uniq,
-        skipped_image_files: skipped_image_files.uniq,
-        failed_image_urls: failed_image_urls,
-        sqlite_database_file: sqlite_store.database_file
-      )
     end
 
     private
@@ -200,80 +206,58 @@ module PinterestScrapper
       result
     end
 
-    def load_url_manifest
-      sqlite_store.load_url_manifest
+    def load_pin_urls
+      sqlite_store.load_pins.map { |pin| pin.fetch("pin_url") }
     end
 
-    def load_pins_manifest
-      sqlite_store.load_pins_manifest
-    end
-
-    def add_image_urls(url_manifest, image_urls)
-      existing = url_manifest.fetch("image_original_urls")
-      new_urls = image_urls - existing
-      merged = (existing + new_urls).uniq.sort
-      url_manifest["urls"] = merged
-      url_manifest["image_original_urls"] = merged
-      new_urls
-    end
-
-    def add_pins(pins_manifest, pin_urls)
-      known_pin_urls = pins_manifest.fetch("pins").map { |pin| pin.fetch("pin_url") }
-      pin_urls.each do |pin_url|
-        next if known_pin_urls.include?(pin_url)
-
-        pins_manifest.fetch("pins") << { "pin_url" => pin_url, "processed" => false, "interrupted" => false }
-        known_pin_urls << pin_url
-      end
-      pins_manifest["pins"] = unique_pins(pins_manifest.fetch("pins"))
-    end
-
-    def add_seed_pin(pins_manifest, pin_url)
-      return if pins_manifest.fetch("pins").any? { |pin| pin.fetch("pin_url") == pin_url }
-
-      pins_manifest.fetch("pins") << { "pin_url" => pin_url, "processed" => false, "interrupted" => false }
-    end
-
-    def new_pin_urls(pins_manifest, pending_pin_urls, pin_urls)
-      known_pin_urls = pins_manifest.fetch("pins").map { |pin| pin.fetch("pin_url") }
-      pin_urls.reject { |pin_url| known_pin_urls.include?(pin_url) || pending_pin_urls.include?(pin_url) }
-    end
-
-    def mark_pin_processed(pins_manifest, pin_url)
-      pins_manifest.fetch("pins").each do |pin|
-        next unless pin.fetch("pin_url") == pin_url
-
-        pin["processed"] = true
-        pin["interrupted"] = false
+    def pin_records(pin_urls, processed: false, interrupted: false)
+      pin_urls.compact.map do |pin_url|
+        {
+          "pin_url" => pin_url,
+          "processed" => processed,
+          "interrupted" => interrupted
+        }
       end
     end
 
-    def mark_pin_interrupted(pins_manifest, pin_url)
-      pins_manifest.fetch("pins").each do |pin|
-        next unless pin.fetch("pin_url") == pin_url
+    def status_pin_records(pin_urls, processed: false, interrupted: false)
+      pin_records(pin_urls.compact.uniq, processed: processed, interrupted: interrupted)
+    end
 
-        pin["processed"] = false
-        pin["interrupted"] = true
+    def next_unprocessed_pin_url
+      interrupted_pin_url = sqlite_store.next_interrupted_pin_url
+      return interrupted_pin_url if interrupted_pin_url
+
+      loop do
+        opened_cursor = @pin_cursor.nil?
+        @pin_cursor ||= sqlite_store.random_unprocessed_pin_cursor
+        pin_url = @pin_cursor.next_pin_url
+        return pin_url if pin_url
+
+        close_pin_cursor
+        return nil if opened_cursor
       end
     end
 
-    def next_unprocessed_pin(pins_manifest)
-      pins_manifest.fetch("pins").find { |pin| !pin["processed"] && pin["interrupted"] } ||
-        pins_manifest.fetch("pins").find { |pin| !pin["processed"] }
+    def close_pin_cursor
+      @pin_cursor&.close
+      @pin_cursor = nil
     end
 
-    def unique_pins(pins)
-      pins.each_with_object({}) do |pin, unique|
-        pin_url = pin.fetch("pin_url")
-        unique[pin_url] ||= { "pin_url" => pin_url, "processed" => false, "interrupted" => false }
-        unique[pin_url]["processed"] ||= !!pin["processed"]
-        unique[pin_url]["interrupted"] ||= !!pin["interrupted"]
-        unique[pin_url]["interrupted"] = false if unique[pin_url]["processed"]
-      end.values
+    def write_image_urls(image_urls)
+      sqlite_store.write_image_urls(image_urls)
     end
 
-    def write_state(url_manifest, pins_manifest)
-      sqlite_store.write_state(url_manifest: url_manifest, pins_manifest: pins_manifest)
+    def write_pins(pins)
+      sqlite_store.write_pins(pins)
+    end
+
+    def write_interrupted_pins(pins)
+      sqlite_store.write_interrupted_pins(pins)
+    end
+
+    def write_processed_pins(pins)
+      sqlite_store.write_processed_pins(pins)
     end
   end
 end
