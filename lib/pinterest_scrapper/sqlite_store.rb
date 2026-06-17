@@ -8,12 +8,18 @@ require "uri"
 module PinterestScrapper
   class SQLiteStore
     DEFAULT_FILENAME = "pinterest_scrapper.sqlite3"
-    IMAGE_URL_INSERT_CHUNK_SIZE = 400
+    IMAGE_URL_INSERT_CHUNK_SIZE = 25
+    PIN_INSERT_CHUNK_SIZE = 25
+    WAL_AUTOCHECKPOINT_PAGES = 0
+    BUSY_TIMEOUT_MILLISECONDS = 5_000
 
     class PinCursor
       def initialize(database_file)
         @database = SQLite3::Database.new(database_file)
         @database.results_as_hash = true
+        @database.busy_timeout(BUSY_TIMEOUT_MILLISECONDS)
+        @database.execute("PRAGMA synchronous = NORMAL")
+        @database.execute("PRAGMA wal_autocheckpoint = #{WAL_AUTOCHECKPOINT_PAGES}")
         @result_sets = random_rowid_result_sets
       end
 
@@ -54,7 +60,7 @@ module PinterestScrapper
         database.query(
           <<~SQL,
             SELECT pin_url
-            FROM pins
+            FROM pins NOT INDEXED
             WHERE processed = 0
               AND interrupted = 0
               AND #{rowid_predicate}
@@ -91,6 +97,7 @@ module PinterestScrapper
 
       with_database do |database|
         database.execute("PRAGMA journal_mode = WAL")
+        configure_database_connection(database)
         setup_image_urls_table(database)
         database.execute_batch(<<~SQL)
           CREATE TABLE IF NOT EXISTS pins (
@@ -197,7 +204,7 @@ module PinterestScrapper
       cursor&.close
     end
 
-    def write_image_urls(urls)
+    def write_image_urls(urls, progress: nil)
       urls = Array(urls)
       return [] if urls.empty?
 
@@ -205,44 +212,72 @@ module PinterestScrapper
 
       with_database do |database|
         inserted_urls = []
-        database.transaction do
-          urls.each_slice(IMAGE_URL_INSERT_CHUNK_SIZE) do |url_chunk|
-            inserted_urls.concat(insert_image_url_chunk(database, url_chunk))
+        chunks = urls.each_slice(IMAGE_URL_INSERT_CHUNK_SIZE).to_a
+
+        transaction_start_time = monotonic_time
+        database.execute("BEGIN IMMEDIATE")
+        progress&.call("Image URL DB transaction started in #{elapsed_time(transaction_start_time)}.")
+
+        begin
+          chunks.each_with_index do |url_chunk, index|
+            chunk_start_time = monotonic_time
+            inserted_chunk_urls = insert_image_url_chunk(database, url_chunk)
+            inserted_urls.concat(inserted_chunk_urls)
+            duplicated_count = url_chunk.length - inserted_chunk_urls.length
+            progress&.call(
+              "Image URL DB chunk #{index + 1}/#{chunks.length}: " \
+              "#{inserted_chunk_urls.length} inserted, #{duplicated_count} duplicated in #{elapsed_time(chunk_start_time)}."
+            )
           end
+
+          commit_start_time = monotonic_time
+          database.execute("COMMIT")
+          progress&.call("Image URL DB transaction committed in #{elapsed_time(commit_start_time)}.")
+        rescue StandardError
+          database.execute("ROLLBACK") rescue nil
+          raise
         end
+
         inserted_urls
       end
     end
 
-    def write_pins(pins)
+    def write_pins(pins, progress: nil)
       pins = Array(pins)
       return 0 if pins.empty?
 
       setup
-      inserted_count = 0
 
       with_database do |database|
-        database.transaction do
-          statement = database.prepare(<<~SQL)
-            INSERT OR IGNORE INTO pins (pin_url, processed, interrupted, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-          SQL
-          begin
-            pins.each do |pin|
-              statement.execute(
-                pin.fetch("pin_url"),
-                pin["processed"] ? 1 : 0,
-                pin["interrupted"] ? 1 : 0
-              )
-              inserted_count += 1 unless database.changes.zero?
-            end
-          ensure
-            close_statement(statement)
-          end
-        end
-      end
+        inserted_count = 0
+        chunk_count = (pins.length.to_f / PIN_INSERT_CHUNK_SIZE).ceil
 
-      inserted_count
+        transaction_start_time = monotonic_time
+        database.execute("BEGIN IMMEDIATE")
+        progress&.call("Pin DB transaction started in #{elapsed_time(transaction_start_time)}.")
+
+        begin
+          pins.each_slice(PIN_INSERT_CHUNK_SIZE).with_index do |pin_chunk, index|
+            chunk_start_time = monotonic_time
+            inserted_chunk_count = insert_pin_chunk(database, pin_chunk)
+            inserted_count += inserted_chunk_count
+            duplicated_count = pin_chunk.length - inserted_chunk_count
+            progress&.call(
+              "Pin DB chunk #{index + 1}/#{chunk_count}: " \
+              "#{inserted_chunk_count} inserted, #{duplicated_count} duplicated in #{elapsed_time(chunk_start_time)}."
+            )
+          end
+
+          commit_start_time = monotonic_time
+          database.execute("COMMIT")
+          progress&.call("Pin DB transaction committed in #{elapsed_time(commit_start_time)}.")
+        rescue StandardError
+          database.execute("ROLLBACK") rescue nil
+          raise
+        end
+
+        inserted_count
+      end
     end
 
     def write_interrupted_pins(pins)
@@ -270,8 +305,37 @@ module PinterestScrapper
       close_statement(statement)
     end
 
+    def insert_pin_chunk(database, pins)
+      values_sql = Array.new(pins.length, "(?, ?, ?, CURRENT_TIMESTAMP)").join(", ")
+      statement = database.prepare(<<~SQL)
+        INSERT OR IGNORE INTO pins (pin_url, processed, interrupted, updated_at)
+        VALUES #{values_sql}
+        RETURNING pin_url
+      SQL
+      bind_values = pins.flat_map do |pin|
+        [
+          pin.fetch("pin_url"),
+          pin["processed"] ? 1 : 0,
+          pin["interrupted"] ? 1 : 0
+        ]
+      end
+      result_set = statement.execute(*bind_values)
+      result_set.map { |row| row.fetch("pin_url") }.length
+    ensure
+      result_set&.close
+      close_statement(statement)
+    end
+
     def close_statement(statement)
       statement&.close unless statement&.closed?
+    end
+
+    def monotonic_time
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    def elapsed_time(start_time)
+      "#{format('%.3f', monotonic_time - start_time)}s"
     end
 
     def write_pins_update_first(pins)
@@ -368,9 +432,17 @@ module PinterestScrapper
     def with_database
       database = SQLite3::Database.new(database_file)
       database.results_as_hash = true
+      configure_database_connection(database)
       yield database
     ensure
       database&.close
+    end
+
+    def configure_database_connection(database)
+      database.busy_timeout(BUSY_TIMEOUT_MILLISECONDS)
+      database.execute("PRAGMA synchronous = NORMAL")
+      database.execute("PRAGMA wal_autocheckpoint = #{WAL_AUTOCHECKPOINT_PAGES}")
+      database.execute("PRAGMA temp_store = MEMORY")
     end
   end
 end

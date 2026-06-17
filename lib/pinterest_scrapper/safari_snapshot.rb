@@ -13,6 +13,7 @@ module PinterestScrapper
     PROGRESS_PREFIX = "PinterestScrapperProgress: "
     STABLE_SCROLLS = 3
     WAIT_SECONDS = 2
+    PAGE_DOWN_DELAY_SECONDS = 0.15
     SCROLL_WAIT_SECONDS = 1
 
     COLLECT_URLS_JAVASCRIPT = <<~JS.freeze
@@ -270,6 +271,7 @@ module PinterestScrapper
           tell application "Safari"
             do JavaScript "window.scrollBy(0, Math.max(document.documentElement.clientHeight, 900));" in targetTab
           end tell
+          delay #{PAGE_DOWN_DELAY_SECONDS}
           delay #{SCROLL_WAIT_SECONDS}
 
           tell application "Safari"

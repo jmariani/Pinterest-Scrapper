@@ -67,6 +67,8 @@ module PinterestScrapper
     def result_count(result, count_method, collection_method)
       if result.respond_to?(count_method) && !result.public_send(count_method).nil?
         result.public_send(count_method)
+      elsif result.respond_to?(:stopped_early) && result.stopped_early
+        "not counted after stop"
       else
         result.public_send(collection_method).length
       end

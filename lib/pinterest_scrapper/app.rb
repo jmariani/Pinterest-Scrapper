@@ -26,6 +26,7 @@ module PinterestScrapper
       :skipped_image_files,
       :failed_image_urls,
       :sqlite_database_file,
+      :stopped_early,
       keyword_init: true
     )
 
@@ -93,6 +94,7 @@ module PinterestScrapper
             report_progress "Stop requested. Marking current pin as interrupted."
             close_pin_cursor
             write_interrupted_pins(status_pin_records([next_url, last_scraped_page.pin_url], interrupted: true))
+            report_progress "Current pin marked interrupted."
             stopped_early = true
             break
           end
@@ -118,8 +120,8 @@ module PinterestScrapper
 
         image_original_urls = stopped_early ? [] : sqlite_store.load_image_urls
         pin_urls = stopped_early ? [] : load_pin_urls
-        image_original_url_count = stopped_early ? sqlite_store.image_url_count : image_original_urls.length
-        pin_url_count = stopped_early ? sqlite_store.pin_count : pin_urls.length
+        image_original_url_count = stopped_early ? nil : image_original_urls.length
+        pin_url_count = stopped_early ? nil : pin_urls.length
 
         Result.new(
           target_folder: File.expand_path(target_folder),
@@ -133,7 +135,8 @@ module PinterestScrapper
           saved_image_files: saved_image_files.uniq,
           skipped_image_files: skipped_image_files.uniq,
           failed_image_urls: failed_image_urls,
-          sqlite_database_file: sqlite_store.database_file
+          sqlite_database_file: sqlite_store.database_file,
+          stopped_early: stopped_early
         )
       ensure
         close_pin_cursor
@@ -245,11 +248,11 @@ module PinterestScrapper
     end
 
     def write_image_urls(image_urls)
-      sqlite_store.write_image_urls(image_urls)
+      sqlite_store.write_image_urls(image_urls, progress: progress)
     end
 
     def write_pins(pins)
-      sqlite_store.write_pins(pins)
+      sqlite_store.write_pins(pins, progress: progress)
     end
 
     def write_interrupted_pins(pins)

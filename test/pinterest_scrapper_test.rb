@@ -20,6 +20,7 @@ class PinterestScrapperTest < Minitest::Test
     :skipped_image_files,
     :failed_image_urls,
     :sqlite_database_file,
+    :stopped_early,
     keyword_init: true
   )
 
@@ -80,14 +81,14 @@ class PinterestScrapperTest < Minitest::Test
       pins.length
     end
 
-    def write_image_urls(urls)
+    def write_image_urls(urls, progress: nil)
       written_image_url_batches << urls
       inserted_urls = urls.reject { |url| image_urls.include?(url) }
       image_urls.concat(inserted_urls)
       inserted_urls
     end
 
-    def write_pins(pins)
+    def write_pins(pins, progress: nil)
       written_pin_batches << pins
       inserted_count = 0
       pins.each do |pin|
@@ -249,7 +250,8 @@ class PinterestScrapperTest < Minitest::Test
             saved_image_files: [],
             skipped_image_files: [],
             failed_image_urls: [],
-            sqlite_database_file: File.join(target_folder, "pinterest_scrapper.sqlite3")
+            sqlite_database_file: File.join(target_folder, "pinterest_scrapper.sqlite3"),
+            stopped_early: false
           )
         )
       end
@@ -350,6 +352,45 @@ class PinterestScrapperTest < Minitest::Test
     end
   end
 
+  def test_cli_reports_counts_as_not_counted_after_stop
+    Dir.mktmpdir do |dir|
+      target_folder = File.join(dir, "downloads")
+      stdout = StringIO.new
+      stderr = StringIO.new
+      app_factory = lambda do |_target_folder, pinterest_url|
+        FakeApp.new(
+          result: FakeResult.new(
+            target_folder: target_folder,
+            pinterest_url: pinterest_url.to_s,
+            pin_url: pinterest_url.to_s,
+            pin_urls: [],
+            pin_url_count: nil,
+            urls: [],
+            image_original_urls: [],
+            image_original_url_count: nil,
+            saved_image_files: [],
+            skipped_image_files: [],
+            failed_image_urls: [],
+            sqlite_database_file: File.join(target_folder, "pinterest_scrapper.sqlite3"),
+            stopped_early: true
+          )
+        )
+      end
+
+      status = PinterestScrapper::CLI.new(
+        [target_folder, "https://www.pinterest.com/pin/123456789/"],
+        stdout: stdout,
+        stderr: stderr,
+        app_factory: app_factory
+      ).call
+
+      assert_equal 0, status
+      assert_includes stdout.string, "Pin URLs: not counted after stop"
+      assert_includes stdout.string, "Image original URLs: not counted after stop"
+      assert_empty stderr.string
+    end
+  end
+
   def test_cli_uses_interrupted_pin_from_sqlite
     Dir.mktmpdir do |dir|
       target_folder = File.join(dir, "downloads")
@@ -410,6 +451,37 @@ class PinterestScrapperTest < Minitest::Test
     end
   end
 
+  def test_sqlite_store_random_pin_cursor_uses_rowid_scan_without_temp_sort
+    Dir.mktmpdir do |dir|
+      store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
+      store.write_pins(
+        10.times.map do |index|
+          {
+            "pin_url" => "https://www.pinterest.com/pin/#{index}/",
+            "processed" => index.even?,
+            "interrupted" => false
+          }
+        end
+      )
+      database = SQLite3::Database.new(store.database_file)
+      plan = database.execute(<<~SQL, [5]).map { |row| row.fetch(3) }
+        EXPLAIN QUERY PLAN
+        SELECT pin_url
+        FROM pins NOT INDEXED
+        WHERE processed = 0
+          AND interrupted = 0
+          AND rowid >= ?
+        ORDER BY rowid
+      SQL
+
+      assert plan.any? { |entry| entry.include?("INTEGER PRIMARY KEY") }
+      refute plan.any? { |entry| entry.include?("USE TEMP B-TREE") }
+      refute plan.any? { |entry| entry.include?("index_pins_processing_state") }
+    ensure
+      database&.close
+    end
+  end
+
   def test_sqlite_store_defaults_created_at_to_current_timestamp
     Dir.mktmpdir do |dir|
       store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
@@ -434,6 +506,50 @@ class PinterestScrapperTest < Minitest::Test
       assert_match(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\z/, pin_created_at)
     ensure
       database&.close
+    end
+  end
+
+  def test_sqlite_store_reports_image_url_insert_progress
+    Dir.mktmpdir do |dir|
+      store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
+      progress_messages = []
+
+      store.write_image_urls(
+        ["https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg"],
+        progress: ->(message) { progress_messages << message }
+      )
+
+      assert progress_messages.any? { |message| message.match?(/\AImage URL DB transaction started in \d+\.\d{3}s\./) }
+      assert progress_messages.any? { |message| message.match?(/\AImage URL DB chunk 1\/1: 1 inserted, 0 duplicated in \d+\.\d{3}s\./) }
+      assert progress_messages.any? { |message| message.match?(/\AImage URL DB transaction committed in \d+\.\d{3}s\./) }
+    end
+  end
+
+  def test_sqlite_store_reports_pin_insert_progress
+    Dir.mktmpdir do |dir|
+      store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
+      progress_messages = []
+
+      store.write_pins(
+        [{ "pin_url" => "https://www.pinterest.com/pin/123456789/", "processed" => false, "interrupted" => false }],
+        progress: ->(message) { progress_messages << message }
+      )
+
+      assert progress_messages.any? { |message| message.match?(/\APin DB transaction started in \d+\.\d{3}s\./) }
+      assert progress_messages.any? { |message| message.match?(/\APin DB chunk 1\/1: 1 inserted, 0 duplicated in \d+\.\d{3}s\./) }
+      assert progress_messages.any? { |message| message.match?(/\APin DB transaction committed in \d+\.\d{3}s\./) }
+    end
+  end
+
+  def test_sqlite_store_disables_wal_autocheckpoint_for_fast_scraper_commits
+    Dir.mktmpdir do |dir|
+      store = PinterestScrapper::SQLiteStore.new(target_folder: dir)
+      store.setup
+      store.send(:with_database) do |database|
+        assert_equal "wal", database.get_first_value("PRAGMA journal_mode")
+        assert_equal 1, database.get_first_value("PRAGMA synchronous")
+        assert_equal 0, database.get_first_value("PRAGMA wal_autocheckpoint")
+      end
     end
   end
 
@@ -909,6 +1025,12 @@ class PinterestScrapperTest < Minitest::Test
       def store.load_pins
         raise "loaded pins"
       end
+      def store.image_url_count
+        raise "counted image URLs"
+      end
+      def store.pin_count
+        raise "counted pins"
+      end
 
       result = PinterestScrapper::App.new(
         target_folder: dir,
@@ -920,8 +1042,9 @@ class PinterestScrapperTest < Minitest::Test
         stop_requested: -> { stop_state[:requested] }
       ).run
 
-      assert_equal 1, result.image_original_url_count
-      assert_equal 1, result.pin_url_count
+      assert_nil result.image_original_url_count
+      assert_nil result.pin_url_count
+      assert result.stopped_early
       assert_empty result.image_original_urls
       assert_empty result.pin_urls
     end
@@ -1221,7 +1344,8 @@ class PinterestScrapperTest < Minitest::Test
           saved_image_files: [File.join(target_folder, "abcdef.jpg")],
           skipped_image_files: [],
           failed_image_urls: [],
-          sqlite_database_file: File.join(target_folder, "pinterest_scrapper.sqlite3")
+          sqlite_database_file: File.join(target_folder, "pinterest_scrapper.sqlite3"),
+          stopped_early: false
         )
       )
     end
