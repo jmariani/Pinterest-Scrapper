@@ -40,7 +40,9 @@ module PinterestScrapper
         write_stdout "Saved images: #{result.saved_image_files.length}"
         write_stdout "Skipped images: #{result.skipped_image_files.length}"
         write_stdout "Failed images: #{result.failed_image_urls.length}"
+        write_stdout "Global image counters: saved #{result.image_saved_count}. inserted #{result.image_inserted_count}. failed #{result.image_failed_count}."
         write_stdout "SQLite database: #{result.sqlite_database_file}"
+        write_stdout "Finished."
       end
 
       SUCCESS

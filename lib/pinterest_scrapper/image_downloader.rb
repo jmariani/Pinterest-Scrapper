@@ -8,6 +8,7 @@ require "uri"
 module PinterestScrapper
   class ImageDownloader
     Result = Struct.new(:saved_files, :skipped_files, :failed_urls, keyword_init: true)
+    ImageResult = Struct.new(:saved_file, :skipped_file, :failed_url, keyword_init: true)
 
     DEFAULT_WORKERS = 10
     MAX_REDIRECTS = 5
@@ -15,6 +16,12 @@ module PinterestScrapper
     def initialize(fetcher: nil, workers: DEFAULT_WORKERS)
       @fetcher = fetcher
       @workers = workers
+      @destination_mutexes = Hash.new { |hash, key| hash[key] = Mutex.new }
+      @destination_mutexes_mutex = Mutex.new
+    end
+
+    def worker_count_for(total)
+      [[workers.to_i, 1].max, total.to_i].min
     end
 
     def download_all(urls, target_folder, progress: nil, stop_requested: nil)
@@ -66,12 +73,35 @@ module PinterestScrapper
       Result.new(saved_files: saved_files.uniq, skipped_files: skipped_files.uniq, failed_urls: failed_urls)
     end
 
+    def download_one(url, target_folder, index:, total:, progress: nil)
+      FileUtils.mkdir_p(target_folder)
+      destination = destination_path(url, target_folder, index)
+      image_body = download(url)
+      action = destination_mutex_for(destination).synchronize { keep_best_image(image_body, destination) }
+      expanded_destination = File.expand_path(destination)
+
+      if action == :skipped
+        progress&.call("Skipped image #{index + 1}/#{total}: #{File.basename(destination)}")
+        ImageResult.new(skipped_file: expanded_destination)
+      else
+        progress&.call("#{download_progress_action(action)} image #{index + 1}/#{total}: #{File.basename(destination)}")
+        ImageResult.new(saved_file: expanded_destination)
+      end
+    rescue StandardError => e
+      progress&.call("Failed image #{index + 1}/#{total}: #{File.basename(destination)} (#{e.message})")
+      ImageResult.new(failed_url: url)
+    end
+
     private
 
     attr_reader :fetcher, :workers
 
     def worker_count(urls)
-      [[workers.to_i, 1].max, urls.length].min
+      worker_count_for(urls.length)
+    end
+
+    def destination_mutex_for(destination)
+      @destination_mutexes_mutex.synchronize { @destination_mutexes[destination] }
     end
 
     def download(url, redirect_count: 0)

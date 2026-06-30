@@ -2,16 +2,21 @@
 
 require "fileutils"
 require "digest"
+require "set"
 require "sqlite3"
 require "uri"
 
 module PinterestScrapper
   class SQLiteStore
     DEFAULT_FILENAME = "pinterest_scrapper.sqlite3"
-    IMAGE_URL_INSERT_CHUNK_SIZE = 25
-    PIN_INSERT_CHUNK_SIZE = 25
+    IMAGE_URL_INSERT_CHUNK_SIZE = 400
+    PIN_INSERT_CHUNK_SIZE = 300
     WAL_AUTOCHECKPOINT_PAGES = 0
     BUSY_TIMEOUT_MILLISECONDS = 5_000
+    CHECKPOINT_BUSY_TIMEOUT_MILLISECONDS = 100
+    CACHE_SIZE_KIB = 200_000
+    MMAP_SIZE_BYTES = 256 * 1024 * 1024
+    TRANSACTION_BEGIN_SQL = "BEGIN"
 
     class PinCursor
       def initialize(database_file)
@@ -20,6 +25,8 @@ module PinterestScrapper
         @database.busy_timeout(BUSY_TIMEOUT_MILLISECONDS)
         @database.execute("PRAGMA synchronous = NORMAL")
         @database.execute("PRAGMA wal_autocheckpoint = #{WAL_AUTOCHECKPOINT_PAGES}")
+        @database.execute("PRAGMA cache_size = -#{CACHE_SIZE_KIB}")
+        @database.execute("PRAGMA mmap_size = #{MMAP_SIZE_BYTES}")
         @result_sets = random_rowid_result_sets
       end
 
@@ -83,11 +90,36 @@ module PinterestScrapper
       def close; end
     end
 
+    class ImageUrlTransaction
+      def initialize(store, database)
+        @store = store
+        @database = database
+      end
+
+      def insert(url)
+        store.send(:insert_single_image_url, database, url)
+      rescue SQLite3::Exception
+        false
+      end
+
+      private
+
+      attr_reader :store, :database
+    end
+
     attr_reader :database_file
 
     def initialize(target_folder:, database_file: nil)
       @database_file = File.expand_path(database_file || File.join(target_folder, DEFAULT_FILENAME))
       @setup_complete = false
+      @database = nil
+      @wal_checkpoint_mutex = Mutex.new
+      @wal_checkpoint_thread = nil
+    end
+
+    def close
+      @database&.close
+      @database = nil
     end
 
     def setup
@@ -215,7 +247,7 @@ module PinterestScrapper
         chunks = urls.each_slice(IMAGE_URL_INSERT_CHUNK_SIZE).to_a
 
         transaction_start_time = monotonic_time
-        database.execute("BEGIN IMMEDIATE")
+        database.execute(TRANSACTION_BEGIN_SQL)
         progress&.call("Image URL DB transaction started in #{elapsed_time(transaction_start_time)}.")
 
         begin
@@ -242,6 +274,28 @@ module PinterestScrapper
       end
     end
 
+    def with_image_url_transaction(progress: nil)
+      setup
+
+      with_database do |database|
+        transaction_start_time = monotonic_time
+        database.execute(TRANSACTION_BEGIN_SQL)
+        progress&.call("Image URL DB transaction started in #{elapsed_time(transaction_start_time)}.")
+
+        begin
+          result = yield ImageUrlTransaction.new(self, database)
+
+          commit_start_time = monotonic_time
+          database.execute("COMMIT")
+          progress&.call("Image URL DB transaction committed in #{elapsed_time(commit_start_time)}.")
+          result
+        rescue StandardError
+          database.execute("ROLLBACK") rescue nil
+          raise
+        end
+      end
+    end
+
     def write_pins(pins, progress: nil)
       pins = Array(pins)
       return 0 if pins.empty?
@@ -253,7 +307,7 @@ module PinterestScrapper
         chunk_count = (pins.length.to_f / PIN_INSERT_CHUNK_SIZE).ceil
 
         transaction_start_time = monotonic_time
-        database.execute("BEGIN IMMEDIATE")
+        database.execute(TRANSACTION_BEGIN_SQL)
         progress&.call("Pin DB transaction started in #{elapsed_time(transaction_start_time)}.")
 
         begin
@@ -288,16 +342,60 @@ module PinterestScrapper
       write_pins_update_first(pins)
     end
 
+    def wal_checkpoint
+      setup
+
+      with_database do |database|
+        database.execute("PRAGMA wal_checkpoint(PASSIVE)")
+      end
+    end
+
+    def wal_checkpoint_async(progress: nil)
+      setup
+
+      wal_checkpoint_mutex.synchronize do
+        return :running if wal_checkpoint_thread&.alive?
+
+        @wal_checkpoint_thread = Thread.new do
+          wal_checkpoint_start_time = monotonic_time
+          checkpoint_database = nil
+
+          begin
+            checkpoint_database = SQLite3::Database.new(database_file)
+            checkpoint_database.results_as_hash = true
+            configure_database_connection(checkpoint_database)
+            checkpoint_database.busy_timeout(CHECKPOINT_BUSY_TIMEOUT_MILLISECONDS)
+            checkpoint_database.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            progress&.call("WAL checkpoint completed in #{elapsed_time(wal_checkpoint_start_time)}.")
+          rescue SQLite3::Exception => e
+            progress&.call("WAL checkpoint skipped: #{e.class}: #{e.message}")
+          ensure
+            checkpoint_database&.close
+          end
+        end
+
+        :started
+      end
+    end
+
     private
 
+    attr_reader :wal_checkpoint_mutex, :wal_checkpoint_thread
+
     def insert_image_url_chunk(database, urls)
-      values_sql = Array.new(urls.length, "(?, ?)").join(", ")
+      existing_image_names, existing_urls = existing_image_url_keys(database, urls)
+      urls_to_insert = urls.reject do |url|
+        existing_image_names.include?(image_name_for(url)) || existing_urls.include?(url)
+      end
+      return [] if urls_to_insert.empty?
+
+      values_sql = Array.new(urls_to_insert.length, "(?, ?)").join(", ")
       statement = database.prepare(<<~SQL)
         INSERT OR IGNORE INTO image_urls (image_name, url)
         VALUES #{values_sql}
         RETURNING url
       SQL
-      bind_values = urls.flat_map { |url| [image_name_for(url), url] }
+      bind_values = urls_to_insert.flat_map { |url| [image_name_for(url), url] }
       result_set = statement.execute(*bind_values)
       result_set.map { |row| row.fetch("url") }
     ensure
@@ -305,14 +403,29 @@ module PinterestScrapper
       close_statement(statement)
     end
 
+    def insert_single_image_url(database, url)
+      statement = database.prepare(<<~SQL)
+        INSERT INTO image_urls (image_name, url)
+        VALUES (?, ?)
+      SQL
+      statement.execute(image_name_for(url), url)
+      true
+    ensure
+      close_statement(statement)
+    end
+
     def insert_pin_chunk(database, pins)
-      values_sql = Array.new(pins.length, "(?, ?, ?, CURRENT_TIMESTAMP)").join(", ")
+      existing_urls = existing_pin_urls(database, pins)
+      pins_to_insert = pins.reject { |pin| existing_urls.include?(pin.fetch("pin_url")) }
+      return 0 if pins_to_insert.empty?
+
+      values_sql = Array.new(pins_to_insert.length, "(?, ?, ?, CURRENT_TIMESTAMP)").join(", ")
       statement = database.prepare(<<~SQL)
         INSERT OR IGNORE INTO pins (pin_url, processed, interrupted, updated_at)
         VALUES #{values_sql}
         RETURNING pin_url
       SQL
-      bind_values = pins.flat_map do |pin|
+      bind_values = pins_to_insert.flat_map do |pin|
         [
           pin.fetch("pin_url"),
           pin["processed"] ? 1 : 0,
@@ -321,6 +434,43 @@ module PinterestScrapper
       end
       result_set = statement.execute(*bind_values)
       result_set.map { |row| row.fetch("pin_url") }.length
+    ensure
+      result_set&.close
+      close_statement(statement)
+    end
+
+    def existing_image_url_keys(database, urls)
+      image_names = urls.map { |url| image_name_for(url) }
+      placeholders = Array.new(urls.length, "?").join(", ")
+      statement = database.prepare(<<~SQL)
+        SELECT image_name, url
+        FROM image_urls
+        WHERE image_name IN (#{placeholders})
+           OR url IN (#{placeholders})
+      SQL
+      result_set = statement.execute(*(image_names + urls))
+      existing_image_names = Set.new
+      existing_urls = Set.new
+      result_set.each do |row|
+        existing_image_names << row.fetch("image_name")
+        existing_urls << row.fetch("url")
+      end
+      [existing_image_names, existing_urls]
+    ensure
+      result_set&.close
+      close_statement(statement)
+    end
+
+    def existing_pin_urls(database, pins)
+      pin_urls = pins.map { |pin| pin.fetch("pin_url") }
+      placeholders = Array.new(pin_urls.length, "?").join(", ")
+      statement = database.prepare(<<~SQL)
+        SELECT pin_url
+        FROM pins
+        WHERE pin_url IN (#{placeholders})
+      SQL
+      result_set = statement.execute(*pin_urls)
+      result_set.each_with_object(Set.new) { |row, set| set << row.fetch("pin_url") }
     ensure
       result_set&.close
       close_statement(statement)
@@ -430,12 +580,16 @@ module PinterestScrapper
     end
 
     def with_database
-      database = SQLite3::Database.new(database_file)
-      database.results_as_hash = true
-      configure_database_connection(database)
-      yield database
-    ensure
-      database&.close
+      yield database_connection
+    end
+
+    def database_connection
+      @database ||= begin
+        database = SQLite3::Database.new(database_file)
+        database.results_as_hash = true
+        configure_database_connection(database)
+        database
+      end
     end
 
     def configure_database_connection(database)
@@ -443,6 +597,8 @@ module PinterestScrapper
       database.execute("PRAGMA synchronous = NORMAL")
       database.execute("PRAGMA wal_autocheckpoint = #{WAL_AUTOCHECKPOINT_PAGES}")
       database.execute("PRAGMA temp_store = MEMORY")
+      database.execute("PRAGMA cache_size = -#{CACHE_SIZE_KIB}")
+      database.execute("PRAGMA mmap_size = #{MMAP_SIZE_BYTES}")
     end
   end
 end

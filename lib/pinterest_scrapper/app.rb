@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "fileutils"
+require "thread"
 require "uri"
 
 require_relative "browser_opener"
@@ -25,8 +26,31 @@ module PinterestScrapper
       :saved_image_files,
       :skipped_image_files,
       :failed_image_urls,
+      :image_saved_count,
+      :image_inserted_count,
+      :image_failed_count,
       :sqlite_database_file,
       :stopped_early,
+      keyword_init: true
+    )
+
+    ImageCounters = Struct.new(:saved, :inserted, :failed, keyword_init: true) do
+      def self.zero
+        new(saved: 0, inserted: 0, failed: 0)
+      end
+
+      def add(other)
+        self.saved += other.saved
+        self.inserted += other.inserted
+        self.failed += other.failed
+      end
+    end
+
+    ImageProcessingResult = Struct.new(
+      :saved_files,
+      :skipped_files,
+      :failed_urls,
+      :counters,
       keyword_init: true
     )
 
@@ -63,6 +87,7 @@ module PinterestScrapper
         saved_image_files = []
         skipped_image_files = []
         failed_image_urls = []
+        image_counters = ImageCounters.zero
         last_scraped_page = nil
         next_url = pinterest_url.to_s
         stopped_early = false
@@ -78,22 +103,20 @@ module PinterestScrapper
           last_scraped_page = scrape_page(next_url)
           collected_pin_urls = last_scraped_page.pin_urls
           collected_image_urls = last_scraped_page.image_original_urls
-          report_progress "#{collected_image_urls.length} original image URLs ready for database insert."
           close_pin_cursor
-          inserted_image_urls = write_image_urls(collected_image_urls)
-          duplicated_image_url_count = collected_image_urls.length - inserted_image_urls.length
-          report_progress "#{collected_image_urls.length} total image URLs. #{inserted_image_urls.length} inserted. #{duplicated_image_url_count} duplicated."
 
           wait_until_unlocked
-          download_result = download_images(inserted_image_urls)
+          download_result = process_images(collected_image_urls)
           saved_image_files.concat(download_result.saved_files)
           skipped_image_files.concat(download_result.skipped_files)
           failed_image_urls.concat(download_result.failed_urls)
+          image_counters.add(download_result.counters)
+          report_progress image_counter_message("Pin image counters", download_result.counters)
 
           if stop_requested?
             report_progress "Stop requested. Marking current pin as interrupted."
             close_pin_cursor
-            write_interrupted_pins(status_pin_records([next_url, last_scraped_page.pin_url], interrupted: true))
+            write_interrupted_pins(status_pin_records([next_url], interrupted: true))
             report_progress "Current pin marked interrupted."
             stopped_early = true
             break
@@ -103,7 +126,8 @@ module PinterestScrapper
           duplicated_pin_count = collected_pin_urls.length - inserted_pin_count
           report_progress "#{collected_pin_urls.length} total pin URLs. #{inserted_pin_count} inserted. #{duplicated_pin_count} duplicated."
 
-          write_processed_pins(status_pin_records([next_url, last_scraped_page.pin_url], processed: true))
+          write_processed_pins(status_pin_records([next_url], processed: true))
+          wal_checkpoint
 
           if stop_requested?
             report_progress "Stop requested. Ending gracefully before the next pin."
@@ -118,10 +142,10 @@ module PinterestScrapper
           report_progress "Processing next pin: #{next_url}"
         end
 
-        image_original_urls = stopped_early ? [] : sqlite_store.load_image_urls
-        pin_urls = stopped_early ? [] : load_pin_urls
-        image_original_url_count = stopped_early ? nil : image_original_urls.length
-        pin_url_count = stopped_early ? nil : pin_urls.length
+        image_original_urls = []
+        pin_urls = []
+        image_original_url_count = stopped_early ? nil : sqlite_store.image_url_count
+        pin_url_count = stopped_early ? nil : sqlite_store.pin_count
 
         Result.new(
           target_folder: File.expand_path(target_folder),
@@ -135,11 +159,15 @@ module PinterestScrapper
           saved_image_files: saved_image_files.uniq,
           skipped_image_files: skipped_image_files.uniq,
           failed_image_urls: failed_image_urls,
+          image_saved_count: image_counters.saved,
+          image_inserted_count: image_counters.inserted,
+          image_failed_count: image_counters.failed,
           sqlite_database_file: sqlite_store.database_file,
           stopped_early: stopped_early
         )
       ensure
         close_pin_cursor
+        sqlite_store.close
       end
     end
 
@@ -197,16 +225,109 @@ module PinterestScrapper
       stop_requested&.call
     end
 
-    def download_images(image_urls)
-      report_progress "Downloading #{image_urls.length} original images..."
+    def process_images(image_urls)
+      report_progress "Processing #{image_urls.length} original images..."
+      saved_files = []
+      skipped_files = []
+      failed_urls = []
+      counters = ImageCounters.zero
+
+      sqlite_store.with_image_url_transaction(progress: progress) do |transaction|
+        worker_count = image_worker_count(image_urls.length)
+        jobs = Queue.new
+        results = Queue.new
+        image_urls.each_with_index { |image_url, index| jobs << [image_url, index] }
+
+        workers = worker_count.times.map do
+          Thread.new do
+            loop do
+              image_url, index = jobs.pop(true)
+              break if stop_requested?
+
+              results << [image_url, save_image(image_url, index, image_urls.length)]
+            rescue ThreadError
+              break
+            end
+
+            results << :done
+          end
+        end
+
+        finished_workers = 0
+        while finished_workers < worker_count
+          result = results.pop
+          if result == :done
+            finished_workers += 1
+            next
+          end
+
+          image_url, image_result = result
+          apply_image_result(transaction, image_url, image_result, saved_files, skipped_files, failed_urls, counters)
+        end
+
+        workers.each(&:join)
+      end
+
+      report_progress "Stop requested. Ending downloads gracefully." if stop_requested?
+      result = ImageProcessingResult.new(
+        saved_files: saved_files.uniq,
+        skipped_files: skipped_files.uniq,
+        failed_urls: failed_urls,
+        counters: counters
+      )
+      report_progress "Saved #{result.saved_files.length} images. Skipped #{result.skipped_files.length}. Failed #{result.failed_urls.length}."
+      result
+    end
+
+    def apply_image_result(transaction, image_url, image_result, saved_files, skipped_files, failed_urls, counters)
+      if image_result.saved_file
+        saved_files << image_result.saved_file
+        counters.saved += 1
+        if transaction.insert(image_url)
+          counters.inserted += 1
+        else
+          counters.failed += 1
+        end
+      elsif image_result.skipped_file
+        skipped_files << image_result.skipped_file
+      elsif image_result.failed_url
+        failed_urls << image_result.failed_url
+        counters.failed += 1
+      end
+    end
+
+    def image_counter_message(label, counters)
+      "#{label}: saved #{counters.saved}. inserted #{counters.inserted}. failed #{counters.failed}."
+    end
+
+    def save_image(image_url, index, total)
+      if image_downloader.respond_to?(:download_one)
+        return image_downloader.download_one(
+          image_url,
+          target_folder,
+          index: index,
+          total: total,
+          progress: progress
+        )
+      end
+
       result = image_downloader.download_all(
-        image_urls,
+        [image_url],
         target_folder,
         progress: progress,
         stop_requested: method(:stop_requested?)
       )
-      report_progress "Saved #{result.saved_files.length} images. Skipped #{result.skipped_files.length}. Failed #{result.failed_urls.length}."
-      result
+      ImageDownloader::ImageResult.new(
+        saved_file: result.saved_files.first,
+        skipped_file: result.skipped_files.first,
+        failed_url: result.failed_urls.first
+      )
+    end
+
+    def image_worker_count(total)
+      return image_downloader.worker_count_for(total) if image_downloader.respond_to?(:worker_count_for)
+
+      [[ImageDownloader::DEFAULT_WORKERS, 1].max, total.to_i].min
     end
 
     def load_pin_urls
@@ -247,10 +368,6 @@ module PinterestScrapper
       @pin_cursor = nil
     end
 
-    def write_image_urls(image_urls)
-      sqlite_store.write_image_urls(image_urls, progress: progress)
-    end
-
     def write_pins(pins)
       sqlite_store.write_pins(pins, progress: progress)
     end
@@ -261,6 +378,23 @@ module PinterestScrapper
 
     def write_processed_pins(pins)
       sqlite_store.write_processed_pins(pins)
+    end
+
+    def wal_checkpoint
+      if sqlite_store.respond_to?(:wal_checkpoint_async)
+        checkpoint_status = sqlite_store.wal_checkpoint_async(progress: ->(message) { report_progress message })
+        case checkpoint_status
+        when :started
+          report_progress "WAL checkpoint started in background."
+        when :running
+          report_progress "WAL checkpoint already running; skipping this pin."
+        end
+      else
+        checkpoint_start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        sqlite_store.wal_checkpoint
+        elapsed_time = format("%.3f", Process.clock_gettime(Process::CLOCK_MONOTONIC) - checkpoint_start_time)
+        report_progress "WAL checkpoint completed in #{elapsed_time}s."
+      end
     end
   end
 end
